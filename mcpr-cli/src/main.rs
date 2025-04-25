@@ -1,4 +1,9 @@
-use std::{collections::BTreeMap, fs::File, io::{BufReader, BufWriter}, sync::{Arc, Mutex}};
+use std::{
+    collections::BTreeMap,
+    fs::File,
+    io::{BufReader, BufWriter},
+    sync::{Arc, Mutex},
+};
 
 use mcpr_lib::mcpr::ReplayStream;
 
@@ -15,13 +20,12 @@ macro_rules! chmax {
     };
 }
 
-
 #[derive(Debug, Parser)]
 #[command(author, version, about, long_about = None)]
 struct Args {
     #[arg(short, long)]
     input: Vec<String>,
-    
+
     #[arg(short, long)]
     output: Option<String>,
 
@@ -45,10 +49,16 @@ struct Args {
 }
 impl Args {
     fn include_packets(&self) -> Vec<u8> {
-        self.include_packets.iter().map(|x|u8::from_str_radix(&x.trim_start_matches("0x"), 16).unwrap()).collect()
+        self.include_packets
+            .iter()
+            .map(|x| u8::from_str_radix(x.trim_start_matches("0x"), 16).unwrap())
+            .collect()
     }
     fn exclude_packets(&self) -> Vec<u8> {
-        self.exclude_packets.iter().map(|x|u8::from_str_radix(&x.trim_start_matches("0x"), 16).unwrap()).collect()
+        self.exclude_packets
+            .iter()
+            .map(|x| u8::from_str_radix(x.trim_start_matches("0x"), 16).unwrap())
+            .collect()
     }
 }
 
@@ -60,11 +70,8 @@ fn main() {
 
     println!("compression level: {:?}", args.compression_level);
 
-    let mut stream_config = ReplayStream::new(
-        args.include_packets.is_empty(),
-        args.unknow_packet,
-    );
-    
+    let mut stream_config = ReplayStream::new(args.include_packets.is_empty(), args.unknow_packet);
+
     stream_config.include(args.include_packets().iter().copied());
     stream_config.exclude(args.exclude_packets().iter().copied());
 
@@ -72,37 +79,46 @@ fn main() {
 
     stream_config.compression_level(args.compression_level);
 
-    let mut readers: Vec<_> = args.input.iter().map(|x|BufReader::new(File::open(x).unwrap())).collect();
+    let mut readers: Vec<_> = args
+        .input
+        .iter()
+        .map(|x| BufReader::new(File::open(x).unwrap()))
+        .collect();
 
-    let mut writer = if let Some(output) = args.output {
-        Some(BufWriter::new(File::create(output).unwrap()))
-    } else {
-        None
-    };
+    let mut writer = args
+        .output
+        .map(|output| BufWriter::new(File::create(output).unwrap()));
 
     let details = if args.packet_details {
         Some((
-                Arc::new(Mutex::new(BTreeMap::new())),
-                Arc::new(Mutex::new(BTreeMap::new()))
+            Arc::new(Mutex::new(BTreeMap::new())),
+            Arc::new(Mutex::new(BTreeMap::new())),
         ))
     } else {
         None
     };
-    stream_config.stream(&mut readers, &mut writer, |packet, writer| {
-        if let Some(w) = writer {
-            packet.write_to(w).unwrap();
-        }
-        if let Some((cnts, size)) = &details {
-            *cnts.lock().unwrap().entry(packet.id()).or_insert(0u32) += 1;
-            *size.lock().unwrap().entry(packet.id()).or_insert(0usize) += packet.data().len();
-        }
-        false
-    }).unwrap();
+    stream_config
+        .stream(&mut readers, &mut writer, |packet, writer| {
+            if let Some(w) = writer {
+                packet.write_to(w).unwrap();
+            }
+            if let Some((cnts, size)) = &details {
+                *cnts.lock().unwrap().entry(packet.id()).or_insert(0u32) += 1;
+                *size.lock().unwrap().entry(packet.id()).or_insert(0usize) += packet.data().len();
+            }
+            false
+        })
+        .unwrap();
 
     println!("Finished!");
 
     if let Some((cnts, size)) = &details {
-        let mut table = vec![[format!("packet"), format!("count"), format!("total size"), format!("avg size")]];
+        let mut table = vec![[
+            "packet".to_string(),
+            "count".to_string(),
+            "total size".to_string(),
+            "avg size".to_string(),
+        ]];
 
         let mut cnts: Vec<_> = cnts.lock().unwrap().clone().into_iter().collect();
         cnts.sort_by_key(|&(a, b)| (b, a));
@@ -111,7 +127,12 @@ fn main() {
         let size = size.lock().unwrap();
         for (id, cnt) in cnts {
             let size = *size.get(&id).unwrap();
-            table.push([format!("0x{:0x}", id), format!("{}", cnt), format!("{}", size), format!("{:.2}", size as f32 / cnt as f32)]);
+            table.push([
+                format!("0x{:0x}", id),
+                format!("{}", cnt),
+                format!("{}", size),
+                format!("{:.2}", size as f32 / cnt as f32),
+            ]);
         }
         let mut table_size = [0usize; 4];
         for low in &table {
@@ -127,32 +148,4 @@ fn main() {
             println!("|");
         }
     }
-
-
-/*
-    let mut map = BTreeMap::new();
-    for input_file_name in &args.input_files {
-        let mut input_file = BufReader::new(File::open(input_file_name).unwrap());
-        let replay = Replay::read(&mut input_file).unwrap();
-        for (time, packet) in replay.packets() {
-            *map.entry(packet.packet_id()).or_insert(0) += 1;
-        }
-        println!("{:#?}", replay.metadata());
-
-        // output
-        let mut output_file = BufWriter::new(File::create(&args.output_file).unwrap());
-        replay.write(&mut output_file).unwrap();
-    }
-    let mut cnts = vec![];
-    for (packet_id, cnt) in map {
-        cnts.push((cnt, packet_id));
-    }
-    cnts.sort();
-    cnts.reverse();
-    for (cnt, packet_id) in cnts {
-        println!("{:0x} : {}", packet_id, cnt);
-    }
-*/
 }
-
-

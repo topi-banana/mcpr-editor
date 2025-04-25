@@ -76,27 +76,26 @@ pub trait Deserializer: io::Read {
 
 impl<R: io::Read + ?Sized> Deserializer for R {}
 
-
 pub trait Serializer: io::Write {
     fn write_varint(&mut self, value: i32) -> io::Result<()> {
-/*
-        const SEGMENT_BITS: i32 = 0x7F;
-        const CONTINUE_BIT: i32 = 0x80;
+        /*
+                const SEGMENT_BITS: i32 = 0x7F;
+                const CONTINUE_BIT: i32 = 0x80;
 
-        let mut val = 0;
-        for i in 0..5 {
-            let byte = self.read_u8()? as i32;
+                let mut val = 0;
+                for i in 0..5 {
+                    let byte = self.read_u8()? as i32;
 
-            val |= (byte & SEGMENT_BITS) << (7 * i);
-            if byte & CONTINUE_BIT == 0 {
-                return Ok(val);
-            }
-        }
-        Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "VarInt is too big",
-        ))
-*/
+                    val |= (byte & SEGMENT_BITS) << (7 * i);
+                    if byte & CONTINUE_BIT == 0 {
+                        return Ok(val);
+                    }
+                }
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "VarInt is too big",
+                ))
+        */
         let mut val = value;
         for _ in 0..5 {
             let b: u8 = val as u8 & 0b01111111;

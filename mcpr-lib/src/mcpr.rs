@@ -1,9 +1,15 @@
-use std::{collections::HashSet, io::{self, Cursor, Read, Seek, Write}};
+use std::{
+    collections::HashSet,
+    io::{self, Cursor, Read, Seek, Write},
+};
 
-use serde::{Serialize, Deserialize};
-use zip::{read::ZipArchive, write::{SimpleFileOptions, ZipWriter}};
+use serde::{Deserialize, Serialize};
+use zip::{
+    read::ZipArchive,
+    write::{SimpleFileOptions, ZipWriter},
+};
 
-use crate::protocol::{Serializer, Deserializer};
+use crate::protocol::{Deserializer, Serializer};
 
 #[derive(Debug, Clone, PartialEq, PartialOrd)]
 pub struct Packet {
@@ -119,7 +125,7 @@ impl ReplayStream {
             packet_restriction: [default; 256],
             unknow_packet,
             compression_level: None,
-            interval: 0
+            interval: 0,
         }
     }
     pub fn exclude<T: Iterator<Item = u8>>(&mut self, iter: T) {
@@ -143,20 +149,27 @@ impl ReplayStream {
         self.interval = interval;
     }
 
-    pub fn stream<'a, R, W, F>(&self, readers: &mut [R], writer: &'a mut Option<W>, f: F) -> io::Result<()>
+    pub fn stream<'a, R, W, F>(
+        &self,
+        readers: &mut [R],
+        writer: &'a mut Option<W>,
+        f: F,
+    ) -> io::Result<()>
     where
         R: Read + Seek,
         W: Write + Seek + 'a,
         F: Fn(Packet, &mut Option<ZipWriter<&mut W>>) -> bool,
-     {
-        if readers.is_empty() { return Ok(()); }
+    {
+        if readers.is_empty() {
+            return Ok(());
+        }
         let mut zip_writer = if let Some(e) = writer {
             let mut zipw = ZipWriter::new(e);
             zipw.start_file(
                 "recording.tmcpr",
                 SimpleFileOptions::default()
-                .compression_method(zip::CompressionMethod::Deflated)
-                .compression_level(self.compression_level),
+                    .compression_method(zip::CompressionMethod::Deflated)
+                    .compression_level(self.compression_level),
             )?;
             Some(zipw)
         } else {
@@ -191,7 +204,5 @@ impl ReplayStream {
 #[cfg(test)]
 mod test {
     #[test]
-    fn test() {
-    }
+    fn test() {}
 }
-
