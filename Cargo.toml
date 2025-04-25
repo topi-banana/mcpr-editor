@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "mcpr-lib",
+    "mcpr-cli",
+]
+

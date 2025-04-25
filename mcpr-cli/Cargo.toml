@@ -1,0 +1,13 @@
+[package]
+name = "mcpr-cli"
+version = "0.1.0"
+authors = ["topi_banana"]
+description = "mcpr editor cli"
+
+edition = "2024"
+
+[dependencies]
+mcpr-lib = { path = "../mcpr-lib" }
+
+clap = { version = "4.5.37", features = ["derive"] }
+
