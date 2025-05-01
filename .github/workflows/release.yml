@@ -41,12 +41,12 @@ jobs:
       - name: Rename artifact
         run: |
           mkdir -p dist
-          cp target/${{ matrix.target }}/release/mcpr-cli${{ matrix.ext }} dist/mcpr-editor_${{ matrix.target }}${{ matrix.ext }}
+          cp target/${{ matrix.target }}/release/mcpr-cli${{ matrix.ext }} dist/mcpr-cli_${{ matrix.target }}${{ matrix.ext }}
 
       - name: Upload to Release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/pumpkin-${{ matrix.target }}${{ matrix.ext }}
+          files: dist/mcpr-cli_${{ matrix.target }}${{ matrix.ext }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
