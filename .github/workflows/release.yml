@@ -1,0 +1,52 @@
+name: Release Build and Upload
+
+on:
+  release:
+    types: [created]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-Dwarnings"
+
+jobs:
+  release_build:
+    name: Build and Upload Artifacts
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        target:
+          - x86_64-unknown-linux-gnu
+          - x86_64-pc-windows-msvc
+          - x86_64-apple-darwin
+        include:
+          - os: ubuntu-latest
+            ext: ""
+          - os: windows-latest
+            ext: ".exe"
+          - os: macos-latest
+            ext: ""
+    steps:
+      - uses: actions/checkout@v4
+
+      - run: rustup update stable
+      - run: rustup default stable
+      - run: rustup target add ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Rename artifact
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/pumpkin${{ matrix.ext }} dist/pumpkin-${{ matrix.target }}${{ matrix.ext }}
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/pumpkin-${{ matrix.target }}${{ matrix.ext }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+

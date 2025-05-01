@@ -2,6 +2,12 @@ name: Cargo Build, Test, and Linting
 
 on:
   push:
+    paths:
+      - ".github/**"
+      - "mcpr-cli/**"
+      - "mcpr-lib/**"
+      - "Cargo.lock"
+      - "Cargo.toml"
   pull_request:
 
 env:
