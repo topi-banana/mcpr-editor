@@ -72,9 +72,9 @@ jobs:
       - name: Export executable
         uses: actions/upload-artifact@v4
         with:
-          name: pumpkin-${{ matrix.os }}
+          name: mcpr-editor_${{ matrix.os }}
           compression-level: 9
-          path: target/${{ matrix.target }}/release/pumpkin*
+          path: target/${{ matrix.target }}/release/mcpr*
 
   clippy_release:
     name: Run lints in release mode
