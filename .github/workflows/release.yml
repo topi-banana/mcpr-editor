@@ -41,7 +41,7 @@ jobs:
       - name: Rename artifact
         run: |
           mkdir -p dist
-          cp target/${{ matrix.target }}/release/mcpr-editor${{ matrix.ext }} dist/mcpr-editor_${{ matrix.target }}${{ matrix.ext }}
+          cp target/${{ matrix.target }}/release/mcpr-cli${{ matrix.ext }} dist/mcpr-editor_${{ matrix.target }}${{ matrix.ext }}
 
       - name: Upload to Release
         uses: softprops/action-gh-release@v2
