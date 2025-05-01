@@ -1,11 +1,14 @@
 use std::{
     collections::HashSet,
-    io::{self, Cursor, Read, Seek, Write},
+    fs::File,
+    io::{self, BufReader, BufWriter, Cursor, Read, Seek, Write},
+    path::{Path, PathBuf},
 };
 
 use serde::{Deserialize, Serialize};
 use zip::{
     read::ZipArchive,
+    result::ZipError,
     write::{SimpleFileOptions, ZipWriter},
 };
 
@@ -23,6 +26,9 @@ impl Packet {
     }
     pub fn time(&self) -> u32 {
         self.time
+    }
+    pub fn time_mut(&mut self) -> &mut u32 {
+        &mut self.time
     }
     pub fn id(&self) -> i32 {
         self.id
@@ -67,25 +73,25 @@ impl Packet {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(non_snake_case)]
 pub struct MetaData {
-    singleplayer: bool,
-    serverName: String,
-    customServerName: String,
-    duration: u64,
-    date: u64,
-    mcversion: String,
-    fileFormat: String,
-    fileFormatVersion: u32,
-    protocol: u32,
-    generator: String,
-    selfId: i32,
-    players: HashSet<uuid::Uuid>,
+    pub singleplayer: bool,
+    pub serverName: String,
+    pub customServerName: String,
+    pub duration: u64,
+    pub date: u64,
+    pub mcversion: String,
+    pub fileFormat: String,
+    pub fileFormatVersion: u32,
+    pub protocol: u32,
+    pub generator: String,
+    pub selfId: i32,
+    pub players: HashSet<uuid::Uuid>,
 }
 impl MetaData {
-    pub fn read_from<R: Read>(reader: &mut R) -> Result<Self, serde_json::Error> {
-        serde_json::from_reader(reader)
+    pub fn read_from<R: Read>(reader: R) -> Result<Self, Error> {
+        serde_json::from_reader(reader).map_err(Error::JsonError)
     }
-    pub fn write_to<W: Write>(&self, writer: &mut W) -> Result<(), serde_json::Error> {
-        serde_json::to_writer(writer, self)
+    pub fn write_to<W: Write>(&self, writer: &mut W) -> Result<(), Error> {
+        serde_json::to_writer(writer, self).map_err(Error::JsonError)
     }
 }
 impl Default for MetaData {
@@ -107,102 +113,179 @@ impl Default for MetaData {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct ReplayStream {
-    packet_restriction: [bool; 256],
-    unknow_packet: bool,
-    compression_level: Option<i64>,
-    interval: u32,
+#[derive(Debug)]
+pub enum Error {
+    ZipError(ZipError),
+    IOError(io::Error),
+    JsonError(serde_json::Error),
 }
-impl Default for ReplayStream {
-    fn default() -> Self {
-        Self::new(true, true)
-    }
-}
-impl ReplayStream {
-    pub fn new(default: bool, unknow_packet: bool) -> Self {
-        Self {
-            packet_restriction: [default; 256],
-            unknow_packet,
-            compression_level: None,
-            interval: 0,
-        }
-    }
-    pub fn exclude<T: Iterator<Item = u8>>(&mut self, iter: T) {
-        for p in iter {
-            self.packet_restriction[p as usize] = false;
-        }
-    }
-    pub fn include<T: Iterator<Item = u8>>(&mut self, iter: T) {
-        for p in iter {
-            self.packet_restriction[p as usize] = true;
-        }
-    }
-    pub fn compression_level(&mut self, compression_level: i64) {
-        self.compression_level = if compression_level < 0 {
-            None
-        } else {
-            Some(compression_level)
-        };
-    }
-    pub fn interval(&mut self, interval: u32) {
-        self.interval = interval;
-    }
 
-    pub fn stream<'a, R, W, F>(
-        &self,
-        readers: &mut [R],
-        writer: &'a mut Option<W>,
-        f: F,
-    ) -> io::Result<()>
-    where
-        R: Read + Seek,
-        W: Write + Seek + 'a,
-        F: Fn(Packet, &mut Option<ZipWriter<&mut W>>) -> bool,
-    {
-        if readers.is_empty() {
-            return Ok(());
-        }
-        let mut zip_writer = if let Some(e) = writer {
-            let mut zipw = ZipWriter::new(e);
-            zipw.start_file(
+pub trait ReplayReader {
+    fn read_metadata(&mut self) -> Result<MetaData, Error>;
+    fn get_packet_reader<'a>(
+        &'a mut self,
+    ) -> Result<ReadablePacketStream<Box<dyn Read + 'a>>, Error>;
+}
+pub trait ReplayWriter {
+    fn write_metadata(&mut self, metadata: MetaData) -> Result<(), Error>;
+    fn get_packet_writer<'a>(
+        &'a mut self,
+    ) -> Result<WritablePacketStream<Box<dyn Write + 'a>>, Error>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum State {
+    Handshaking,
+    Status,
+    Login,
+    Configuration,
+    Play,
+}
+pub struct ReadablePacketStream<R> {
+    state: State,
+    reader: R,
+}
+impl<R> ReadablePacketStream<R> {
+    fn new(state: State, reader: R) -> Self {
+        Self { state, reader }
+    }
+}
+impl<R: Read> Iterator for ReadablePacketStream<R> {
+    type Item = (State, Packet);
+    fn next(&mut self) -> Option<Self::Item> {
+        Packet::read_from(&mut self.reader)
+            .unwrap_or_default()
+            .map(|packet| {
+                let old_state = self.state;
+                if old_state == State::Login && packet.id() == 0x02 {
+                    self.state = State::Configuration;
+                }
+                if old_state == State::Configuration && packet.id() == 0x03 {
+                    self.state = State::Play;
+                }
+                (old_state, packet)
+            })
+    }
+}
+pub struct WritablePacketStream<W> {
+    writer: W,
+}
+impl<W> WritablePacketStream<W> {
+    fn new(writer: W) -> Self {
+        Self { writer }
+    }
+}
+impl<W: Write> WritablePacketStream<W> {
+    pub fn push(&mut self, packet: Packet) -> Result<(), io::Error> {
+        packet.write_to(&mut self.writer)
+    }
+}
+
+pub struct MCPRReader<R: Read + Seek> {
+    zip: ZipArchive<R>,
+}
+impl<R: Read + Seek> MCPRReader<R> {
+    pub fn new(reader: R) -> Result<Self, Error> {
+        Ok(Self {
+            zip: ZipArchive::new(reader).map_err(Error::ZipError)?,
+        })
+    }
+}
+impl<R: Read + Seek> ReplayReader for MCPRReader<R> {
+    fn read_metadata(&mut self) -> Result<MetaData, Error> {
+        let file = self.zip.by_name("metaData.json").map_err(Error::ZipError)?;
+        MetaData::read_from(file)
+    }
+    fn get_packet_reader<'a>(
+        &'a mut self,
+    ) -> Result<ReadablePacketStream<Box<dyn Read + 'a>>, Error> {
+        let reader = self
+            .zip
+            .by_name("recording.tmcpr")
+            .map_err(Error::ZipError)?;
+        Ok(ReadablePacketStream::new(State::Login, Box::new(reader)))
+    }
+}
+
+pub struct MCPRWriter<W: Write + Seek> {
+    zip: ZipWriter<W>,
+    compression_level: Option<i64>,
+}
+impl<W: Write + Seek> MCPRWriter<W> {
+    pub fn new(writer: W, compression_level: Option<i64>) -> Result<Self, Error> {
+        Ok(Self {
+            zip: ZipWriter::new(writer),
+            compression_level,
+        })
+    }
+}
+impl<W: Write + Seek> ReplayWriter for MCPRWriter<W> {
+    fn write_metadata(&mut self, metadata: MetaData) -> Result<(), Error> {
+        self.zip
+            .start_file(
+                "metaData.json",
+                SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Deflated)
+                    .compression_level(Some(264)),
+            )
+            .map_err(Error::ZipError)?;
+        metadata.write_to(&mut self.zip)?;
+        Ok(())
+    }
+    fn get_packet_writer<'a>(
+        &'a mut self,
+    ) -> Result<WritablePacketStream<Box<dyn Write + 'a>>, Error> {
+        self.zip
+            .start_file(
                 "recording.tmcpr",
                 SimpleFileOptions::default()
                     .compression_method(zip::CompressionMethod::Deflated)
                     .compression_level(self.compression_level),
-            )?;
-            Some(zipw)
-        } else {
-            None
-        };
-        let mut offset = 0;
-        let mut last = 0;
-        for reader in readers {
-            let mut zip = ZipArchive::new(reader)?;
-            let mut tmcpr_file = zip.by_name("recording.tmcpr")?;
-            while let Some(mut packet) = Packet::read_from(&mut tmcpr_file)? {
-                packet.time += offset;
-                last = packet.time;
-                let p = if packet.id < 256 {
-                    self.packet_restriction[packet.id as usize]
-                } else {
-                    self.unknow_packet
-                };
-                if p && f(packet, &mut zip_writer) {
-                    return Ok(());
-                }
-            }
-            offset = last + self.interval;
-        }
-        if let Some(w) = zip_writer {
-            w.finish()?;
-        }
-        Ok(())
+            )
+            .map_err(Error::ZipError)?;
+        Ok(WritablePacketStream::new(Box::new(&mut self.zip)))
     }
 }
 
-#[cfg(test)]
-mod test {
-    #[test]
-    fn test() {}
+pub struct DirReaderWriter {
+    path: PathBuf,
+}
+impl DirReaderWriter {
+    pub fn new<S: AsRef<Path>>(path: S) -> Option<Self> {
+        if path.as_ref().is_dir() {
+            Some(Self {
+                path: path.as_ref().to_path_buf(),
+            })
+        } else {
+            None
+        }
+    }
+}
+impl ReplayReader for DirReaderWriter {
+    fn read_metadata(&mut self) -> Result<MetaData, Error> {
+        let metadata_json = self.path.join("metaData.json");
+        let reader = BufReader::new(File::open(metadata_json).map_err(Error::IOError)?);
+        MetaData::read_from(reader)
+    }
+    fn get_packet_reader<'a>(
+        &'a mut self,
+    ) -> Result<ReadablePacketStream<Box<dyn Read + 'a>>, Error> {
+        let recording_tmcpr = self.path.join("recording.tmcpr");
+        let reader = BufReader::new(File::open(recording_tmcpr).map_err(Error::IOError)?);
+        Ok(ReadablePacketStream::new(State::Login, Box::new(reader)))
+    }
+}
+impl ReplayWriter for DirReaderWriter {
+    fn write_metadata(&mut self, metadata: MetaData) -> Result<(), Error> {
+        let metadata_json = self.path.join("metaData.json");
+        let mut writer = BufWriter::new(File::create(metadata_json).map_err(Error::IOError)?);
+        metadata.write_to(&mut writer)
+    }
+    fn get_packet_writer<'a>(
+        &'a mut self,
+    ) -> Result<WritablePacketStream<Box<dyn Write + 'a>>, Error> {
+        let recording_tmcpr = self.path.join("recording.tmcpr");
+        let writer = BufWriter::new(File::create(recording_tmcpr).map_err(Error::IOError)?);
+        Ok(WritablePacketStream::new(Box::new(writer)))
+    }
 }
