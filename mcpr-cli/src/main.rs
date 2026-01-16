@@ -5,8 +5,14 @@ use std::{
     path::Path,
 };
 
-use mcpr_lib::mcpr::{
-    DirReaderWriter, MCPRReader, MCPRWriter, MetaData, ReplayReader, ReplayWriter, State,
+use anyhow::Ok;
+use mcpr_lib::{
+    archive::{
+        ArchiveReader, ArchiveWriter,
+        directory::DirArchive,
+        zip::{ZipArchiveReader, ZipArchiveWriter},
+    },
+    mcpr::{MetaData, ReplayReader, ReplayWriter, State},
 };
 
 use clap::Parser;
@@ -26,10 +32,10 @@ macro_rules! chmax {
 #[command(author, version, about, long_about = None)]
 struct Args {
     #[arg(short, long)]
-    input: Vec<String>,
+    input: Vec<std::path::PathBuf>,
 
     #[arg(short, long)]
-    output: Option<String>,
+    output: Option<std::path::PathBuf>,
 
     #[arg(long)]
     exclude_packets: Vec<String>,
@@ -64,7 +70,7 @@ impl Args {
     }
 }
 
-fn main() {
+fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     eprintln!("{:#?}", args);
@@ -72,13 +78,6 @@ fn main() {
     if args.input.is_empty() {
         panic!("At least one input file is required");
     }
-
-    /*
-    println!("input: {:?}", args.input);
-    println!("output: {:?}", args.output);
-
-    println!("compression level: {:?}", args.compression_level);
-    */
 
     let mut packets = [args.include_packets.is_empty(); 256];
     for packet in args.include_packets() {
@@ -88,23 +87,22 @@ fn main() {
         packets[packet as usize] = false
     }
 
-    let mut replay_writer: Option<Box<dyn ReplayWriter>> = if let Some(output) = &args.output {
+    let mut replay_writer = if let Some(output) = &args.output {
         let path = Path::new(output);
         if !path.exists() {
             if let Some(ext) = path.extension() {
                 if ext != "mcpr" {
-                    fs::create_dir(path).unwrap();
+                    fs::create_dir(path)?;
                 }
             }
         }
-        if path.is_dir() {
-            Some(Box::new(DirReaderWriter::new(path).unwrap()))
+        let archive: Box<dyn ArchiveWriter> = if path.is_dir() {
+            Box::new(DirArchive::new(path))
         } else {
-            let writer = BufWriter::new(File::create(path).unwrap());
-            Some(Box::new(
-                MCPRWriter::new(writer, args.compression_level).unwrap(),
-            ))
-        }
+            let writer = BufWriter::new(File::create(path)?);
+            Box::new(ZipArchiveWriter::new(writer, args.compression_level))
+        };
+        Some(ReplayWriter::new(archive))
     } else {
         None
     };
@@ -125,12 +123,13 @@ fn main() {
         for i in 0..args.input.len() {
             eprintln!();
             let path = Path::new(&args.input[i]);
-            let mut readable_replay: Box<dyn ReplayReader> = if path.is_dir() {
-                Box::new(DirReaderWriter::new(path).unwrap())
+            let reader: Box<dyn ArchiveReader> = if path.is_dir() {
+                Box::new(DirArchive::new(path))
             } else {
                 let reader = BufReader::new(File::open(path).unwrap());
-                Box::new(MCPRReader::new(reader).unwrap())
+                Box::new(ZipArchiveReader::new(reader).unwrap())
             };
+            let mut readable_replay = ReplayReader::new(reader);
             for (state, mut packet) in readable_replay.get_packet_reader().unwrap() {
                 *packet.time_mut() += offset as u32;
                 let q = if packet.id() < 0 || packet.id() >= 256 {
@@ -221,4 +220,5 @@ fn main() {
             println!();
         }
     }
+    Ok(())
 }
