@@ -14,10 +14,11 @@ use crate::{
 pub struct Packet {
     time: u32,
     id: i32,
-    data: Vec<u8>,
+    data: Box<[u8]>,
 }
+
 impl Packet {
-    pub fn new(time: u32, id: i32, data: Vec<u8>) -> Self {
+    pub fn new(time: u32, id: i32, data: Box<[u8]>) -> Self {
         Self { time, id, data }
     }
     pub fn time(&self) -> u32 {
@@ -29,7 +30,7 @@ impl Packet {
     pub fn id(&self) -> i32 {
         self.id
     }
-    pub fn data(&self) -> &Vec<u8> {
+    pub fn data(&self) -> &[u8] {
         &self.data
     }
     pub fn length(&self) -> io::Result<u32> {
@@ -50,7 +51,11 @@ impl Packet {
                 let packet_id = cur.read_varint()?;
                 let mut packet_data = Vec::new();
                 cur.read_to_end(&mut packet_data)?;
-                Ok(Some(Packet::new(time, packet_id, packet_data)))
+                Ok(Some(Packet::new(
+                    time,
+                    packet_id,
+                    packet_data.into_boxed_slice(),
+                )))
             }
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(None),
             Err(e) => Err(e),
@@ -115,7 +120,7 @@ pub struct ReadablePacketStream<R> {
     reader: R,
 }
 impl<R> ReadablePacketStream<R> {
-    fn new(state: State, reader: R) -> Self {
+    pub fn new(state: State, reader: R) -> Self {
         Self { state, reader }
     }
 }

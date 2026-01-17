@@ -12,6 +12,7 @@ use mcpr_lib::{
         directory::DirArchive,
         zip::{ZipArchiveReader, ZipArchiveWriter},
     },
+    flashback::FlashbackReader,
     mcpr::{MetaData, ReplayReader, ReplayWriter, State},
 };
 
@@ -70,6 +71,12 @@ impl Args {
     }
 }
 
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum ReplayType {
+    Flashback,
+    ReplayMod,
+}
+
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
@@ -89,12 +96,12 @@ fn main() -> anyhow::Result<()> {
 
     let mut replay_writer = if let Some(output) = &args.output {
         let path = Path::new(output);
-        if !path.exists() {
-            if let Some(ext) = path.extension() {
-                if ext != "mcpr" {
-                    fs::create_dir(path)?;
-                }
-            }
+        if !path.exists()
+            && path
+                .extension()
+                .is_none_or(|ext| ext != "mcpr" && ext != "zip")
+        {
+            fs::create_dir(path)?;
         }
         let archive: Box<dyn ArchiveWriter> = if path.is_dir() {
             Box::new(DirArchive::new(path))
@@ -122,15 +129,41 @@ fn main() -> anyhow::Result<()> {
 
         for i in 0..args.input.len() {
             eprintln!();
-            let path = Path::new(&args.input[i]);
-            let reader: Box<dyn ArchiveReader> = if path.is_dir() {
-                Box::new(DirArchive::new(path))
-            } else {
-                let reader = BufReader::new(File::open(path).unwrap());
-                Box::new(ZipArchiveReader::new(reader).unwrap())
-            };
+            let (replay_type, reader): (ReplayType, Box<dyn ArchiveReader>) =
+                if args.input[i].is_dir() {
+                    let reader = DirArchive::new(&args.input[i]);
+                    let replay_type = if reader.exists("metaData.json") {
+                        ReplayType::ReplayMod
+                    } else if reader.exists("metadata.json") {
+                        ReplayType::Flashback
+                    } else {
+                        panic!("Metadata file not found");
+                    };
+                    (replay_type, Box::new(reader))
+                } else {
+                    let replay_type = if let Some(ext) = args.input[i].extension() {
+                        if ext == "mcpr" {
+                            ReplayType::ReplayMod
+                        } else if ext == "zip" {
+                            ReplayType::Flashback
+                        } else {
+                            panic!("Unsupported file extension");
+                        }
+                    } else {
+                        panic!("Unsupported file extension");
+                    };
+                    let reader = BufReader::new(File::open(&args.input[i])?);
+                    (replay_type, Box::new(ZipArchiveReader::new(reader)?))
+                };
+
+            if replay_type == ReplayType::Flashback {
+                let mut flashback = FlashbackReader::new(reader);
+                println!("{:#?}", flashback.get_metadata()?);
+                flashback.get_packet_reader()?;
+                continue;
+            }
             let mut readable_replay = ReplayReader::new(reader);
-            for (state, mut packet) in readable_replay.get_packet_reader().unwrap() {
+            for (state, mut packet) in readable_replay.get_packet_reader()? {
                 *packet.time_mut() += offset as u32;
                 let q = if packet.id() < 0 || packet.id() >= 256 {
                     args.unknow_packet
@@ -156,10 +189,10 @@ fn main() -> anyhow::Result<()> {
                     size[packet.id() as usize] += packet.data().len();
                 }
                 if let Some(writer) = &mut writable_replay {
-                    writer.push(packet).unwrap();
+                    writer.push(packet)?;
                 }
             }
-            let metadata = readable_replay.read_metadata().unwrap();
+            let metadata = readable_replay.read_metadata()?;
             players.extend(metadata.players);
             offset += metadata.duration + args.interval as u64;
         }

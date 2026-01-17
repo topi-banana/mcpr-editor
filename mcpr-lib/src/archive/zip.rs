@@ -29,7 +29,7 @@ impl<W: Write + Seek> ArchiveWriter for ZipArchiveWriter<W> {
         &'this mut self,
         filename: &str,
     ) -> anyhow::Result<Box<dyn Write + 'this>> {
-        self.zip.start_file(filename, self.option.clone())?;
+        self.zip.start_file(filename, self.option)?;
         Ok(Box::new(&mut self.zip))
     }
 }

@@ -15,6 +15,9 @@ impl DirArchive {
             path: path.as_ref().to_path_buf(),
         }
     }
+    pub fn exists<S: AsRef<Path>>(&self, path: S) -> bool {
+        self.path.join(path).exists()
+    }
 }
 
 impl ArchiveWriter for DirArchive {
