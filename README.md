@@ -31,7 +31,7 @@ Options:
 ### Library
 
 - [x] mcpr IO
-- [ ] flashback IO
+- [x] flashback IO
 - [x] unzipped directory IO
 - [x] packet stream
 - [x] encoder / decoder

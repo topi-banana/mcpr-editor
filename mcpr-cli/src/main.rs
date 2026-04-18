@@ -158,8 +158,40 @@ fn main() -> anyhow::Result<()> {
 
             if replay_type == ReplayType::Flashback {
                 let mut flashback = FlashbackReader::new(reader);
-                println!("{:#?}", flashback.get_metadata()?);
-                flashback.get_packet_reader()?;
+                let meta = flashback.get_metadata()?;
+                eprintln!("{:#?}", meta);
+
+                let chunk_names: Vec<String> = meta.chunks.keys().cloned().collect();
+                let mut action_stats: std::collections::BTreeMap<String, (usize, usize)> =
+                    std::collections::BTreeMap::new();
+                let mut tick: u64 = 0;
+                for chunk_name in &chunk_names {
+                    let chunk = flashback.get_chunk_reader(chunk_name)?;
+                    for action in chunk {
+                        let entry = action_stats
+                            .entry(action.kind().as_str().to_string())
+                            .or_default();
+                        entry.0 += 1;
+                        entry.1 += action.data().len();
+                        if matches!(action.kind(), mcpr_lib::flashback::ActionKind::NextTick) {
+                            tick += 1;
+                        }
+                    }
+                }
+
+                if args.packet_details {
+                    println!("Flashback action stats (ticks observed: {}):", tick);
+                    let name_width = action_stats.keys().map(|s| s.len()).max().unwrap_or(0);
+                    for (kind, (cnt, size)) in &action_stats {
+                        println!(
+                            "  {:<width$} count={:>6} size={:>10}",
+                            kind,
+                            cnt,
+                            size,
+                            width = name_width
+                        );
+                    }
+                }
                 continue;
             }
             let mut readable_replay = ReplayReader::new(reader);
