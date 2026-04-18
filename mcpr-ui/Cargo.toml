@@ -5,3 +5,16 @@ edition = "2024"
 
 [dependencies]
 yew = { version = "0.21", features = ["csr"] }
+mcpr-lib = { path = "../mcpr-lib", default-features = false }
+anyhow = "1.0"
+gloo-file = "0.3"
+# getrandom 0.3 (zip 経由) と 0.2 (yew 経由) の wasm backend を有効化。
+getrandom = { version = "0.3", features = ["wasm_js"] }
+getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"] }
+web-sys = { version = "0.3", features = [
+    "DataTransfer",
+    "DragEvent",
+    "File",
+    "FileList",
+    "HtmlInputElement",
+] }

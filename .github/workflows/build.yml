@@ -6,8 +6,10 @@ on:
       - ".github/**"
       - "mcpr-cli/**"
       - "mcpr-lib/**"
+      - "mcpr-ui/**"
       - "Cargo.lock"
       - "Cargo.toml"
+      - ".cargo/**"
   pull_request:
 
 env:

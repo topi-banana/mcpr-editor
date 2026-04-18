@@ -959,6 +959,12 @@ dependencies = [
 name = "mcpr-ui"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "getrandom 0.2.17",
+ "getrandom 0.3.2",
+ "gloo-file 0.3.0",
+ "mcpr-lib",
+ "web-sys",
  "yew",
 ]
 
@@ -1447,7 +1453,6 @@ version = "1.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e2e054861b4bd027cd373e18e8d8d8e6548085000e41290d95ce0c373a654b4a"
 dependencies = [
- "getrandom 0.3.2",
  "js-sys",
  "serde_core",
  "wasm-bindgen",

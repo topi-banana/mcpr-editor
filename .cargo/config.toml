@@ -1,0 +1,4 @@
+[target.wasm32-unknown-unknown]
+# getrandom 0.3 は wasm32-unknown-unknown で wasm_js backend を明示する必要がある。
+# mcpr-ui の wasm ビルド用。mcpr-cli はこの target を使わないので影響しない。
+rustflags = ['--cfg', 'getrandom_backend="wasm_js"']

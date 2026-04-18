@@ -67,10 +67,7 @@ fn dir_to_dir_roundtrip() {
             .get_chunk_reader(name)
             .unwrap()
             .collect::<Vec<_>>();
-        let copied = reader2
-            .get_chunk_reader(name)
-            .unwrap()
-            .collect::<Vec<_>>();
+        let copied = reader2.get_chunk_reader(name).unwrap().collect::<Vec<_>>();
         assert_eq!(original, copied);
     }
 }
@@ -114,10 +111,7 @@ fn dir_to_zip_roundtrip() {
             .get_chunk_reader(name)
             .unwrap()
             .collect::<Vec<_>>();
-        let copied = reader2
-            .get_chunk_reader(name)
-            .unwrap()
-            .collect::<Vec<_>>();
+        let copied = reader2.get_chunk_reader(name).unwrap().collect::<Vec<_>>();
         assert_eq!(original, copied);
     }
     let _ = fs::remove_file(&dst);

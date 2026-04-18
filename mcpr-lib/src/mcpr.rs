@@ -71,7 +71,7 @@ impl Packet {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[allow(non_snake_case)]
 pub struct MetaData {
     pub singleplayer: bool,
