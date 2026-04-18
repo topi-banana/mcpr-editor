@@ -3,6 +3,12 @@ name = "mcpr-lib"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = ["fs"]
+# ローカルファイルシステム (directory archive) を有効化する。
+# wasm32 向けビルドでは `default-features = false` で除外できる。
+fs = []
+
 [dependencies]
 anyhow = "1.0.100"
 byteorder = "1.5.0"

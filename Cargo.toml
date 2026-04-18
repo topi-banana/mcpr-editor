@@ -3,4 +3,5 @@ resolver = "3"
 members = [
     "mcpr-lib",
     "mcpr-cli",
+    "mcpr-ui",
 ]

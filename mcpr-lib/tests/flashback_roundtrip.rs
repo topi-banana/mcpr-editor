@@ -1,6 +1,8 @@
 //! 実 flashback サンプルを使った end-to-end round-trip 検証。
 //! サンプルファイル非在時は skip する（CI の移植性のため）。
 
+#![cfg(feature = "fs")]
+
 use std::{
     fs::{self, File},
     io::{BufReader, BufWriter},

@@ -1,2 +1,9 @@
 /target
 /tmp
+
+# mcpr-ui: daisyUI setup で生成されるローカルアセット。
+# `curl -sL daisyui.com/fast | bash` で取得する。
+/mcpr-ui/dist
+/mcpr-ui/tailwindcss
+/mcpr-ui/daisyui.mjs
+/mcpr-ui/daisyui-theme.mjs

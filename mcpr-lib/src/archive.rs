@@ -1,3 +1,4 @@
+#[cfg(feature = "fs")]
 pub mod directory;
 pub mod zip;
 
