@@ -38,3 +38,31 @@ trunk build --release
 ```
 
 `dist/` 以下に静的アセットが出力される。
+
+## Cloudflare Pages へのデプロイ
+
+`main` への push で `.github/workflows/deploy.yml` が動き、Direct Upload で Cloudflare Pages に成果物を転送する。
+
+### 初回セットアップ
+
+1. **Pages プロジェクトを作成**
+   - Cloudflare ダッシュボード → Workers & Pages → Create → Pages → **Direct Upload** を選択
+   - プロジェクト名を `mcpr-editor` で作成（workflow の `CF_PAGES_PROJECT` と合わせる）
+   - Production branch は `main` のまま
+
+2. **API token を作成**
+   - My Profile → API Tokens → Create Token → Custom token
+   - 権限に `Account > Cloudflare Pages: Edit` を付与（対象アカウントに絞る）
+   - 発行されたトークンをコピー
+
+3. **GitHub Secrets を登録**
+   リポジトリ Settings → Secrets and variables → Actions で以下を追加:
+   - `CLOUDFLARE_API_TOKEN`: 上で作ったトークン
+   - `CLOUDFLARE_ACCOUNT_ID`: ダッシュボード右サイドバー or URL 中の Account ID
+
+4. `main` に push するか Actions タブから **Deploy mcpr-ui to Cloudflare Pages** を手動実行する。
+   成功すると `https://mcpr-editor.pages.dev/` で閲覧可能。
+
+### プロジェクト名を変えたい場合
+
+`.github/workflows/deploy.yml` の `env.CF_PAGES_PROJECT` を変更し、CF ダッシュボード側のプロジェクト名と一致させる。

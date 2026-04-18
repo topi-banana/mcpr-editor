@@ -1,0 +1,53 @@
+name: Deploy mcpr-ui to Cloudflare Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: cf-pages-deploy
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Cloudflare Pages プロジェクト名。ダッシュボードで作成した名前と一致させる。
+  CF_PAGES_PROJECT: mcpr-editor
+
+jobs:
+  deploy:
+    name: Build and deploy to Cloudflare Pages
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      deployments: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable + wasm32 target
+        run: |
+          rustup update stable
+          rustup default stable
+          rustup target add wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install trunk
+        uses: jetli/trunk-action@v0.5.0
+        with:
+          version: latest
+
+      - name: Install tailwindcss standalone + daisyUI plugin
+        working-directory: mcpr-ui
+        run: curl -sL daisyui.com/fast | bash
+
+      - name: Build release (trunk)
+        working-directory: mcpr-ui
+        run: trunk build --release
+
+      - name: Deploy to Cloudflare Pages
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy mcpr-ui/dist --project-name=${{ env.CF_PAGES_PROJECT }} --branch=main
