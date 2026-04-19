@@ -2,11 +2,12 @@ name: Deploy mcpr-ui to Cloudflare Pages
 
 on:
   push:
-    branches: [main]
+    branches:
+      - "**"
   workflow_dispatch:
 
 concurrency:
-  group: cf-pages-deploy
+  group: cf-pages-deploy-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -50,4 +51,4 @@ jobs:
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          command: pages deploy mcpr-ui/dist --project-name=${{ env.CF_PAGES_PROJECT }} --branch=main
+          command: pages deploy mcpr-ui/dist --project-name=${{ env.CF_PAGES_PROJECT }} --branch=${{ github.ref_name }}
