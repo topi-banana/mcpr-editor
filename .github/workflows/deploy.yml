@@ -2,11 +2,12 @@ name: Deploy mcpr-ui to Cloudflare Pages
 
 on:
   push:
-    branches: [main]
+    branches:
+      - "**"
   workflow_dispatch:
 
 concurrency:
-  group: cf-pages-deploy
+  group: cf-pages-deploy-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -46,8 +47,22 @@ jobs:
         run: trunk build --release
 
       - name: Deploy to Cloudflare Pages
+        id: deploy
         uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          command: pages deploy mcpr-ui/dist --project-name=${{ env.CF_PAGES_PROJECT }} --branch=main
+          command: pages deploy mcpr-ui/dist --project-name=${{ env.CF_PAGES_PROJECT }} --branch=${{ github.ref_name }}
+
+      - name: Write deployment URL to job summary
+        if: always() && steps.deploy.outcome == 'success'
+        run: |
+          {
+            echo "## Cloudflare Pages Deployment"
+            echo ""
+            echo "- Project: \`${{ env.CF_PAGES_PROJECT }}\`"
+            echo "- Branch: \`${{ github.ref_name }}\`"
+            echo "- Commit: \`${{ github.sha }}\`"
+            echo "- Deployment URL: ${{ steps.deploy.outputs.deployment-url }}"
+            echo "- Alias URL: ${{ steps.deploy.outputs.pages-deployment-alias-url }}"
+          } >> "$GITHUB_STEP_SUMMARY"
