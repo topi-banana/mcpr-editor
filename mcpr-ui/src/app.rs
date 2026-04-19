@@ -612,11 +612,7 @@ fn TimelineView(props: &TimelineViewProps) -> Html {
                 pointer-events="none"
                 stroke-dasharray="3,2" />
         };
-        let lane_state = data
-            .lanes
-            .get(info.lane_idx)
-            .map(|l| l.state)
-            .unwrap_or("");
+        let lane_state = data.lanes.get(info.lane_idx).map(|l| l.state).unwrap_or("");
         let tip = html! {
             <div class="pointer-events-none absolute z-10 rounded bg-neutral text-neutral-content text-xs font-mono px-2 py-1 shadow"
                 style={format!(
