@@ -8,7 +8,7 @@ use mcpr_lib::{
     archive::zip::ZipArchiveReader,
     mcpr::{MetaData, ReplayReader, State},
 };
-use web_sys::{DragEvent, Element, Event, HtmlInputElement, MouseEvent};
+use web_sys::{DragEvent, Element, Event, HtmlInputElement, MouseEvent, WheelEvent};
 use yew::prelude::*;
 
 const PAGE_SIZE: usize = 200;
@@ -451,13 +451,27 @@ fn TimelineView(props: &TimelineViewProps) -> Html {
         })
     };
     let hover = use_state(|| Option::<HoverInfo>::None);
+    // viewBox の可視 x 範囲 (0..TIMELINE_VB_W)。ズーム/パンで変わる。
+    let view_range = use_state(|| (0.0_f64, TIMELINE_VB_W as f64));
+    // data 再生成 (別ファイルロード) 時に view_range をリセットする。
+    {
+        let view_range = view_range.clone();
+        use_effect_with((packets_len, duration), move |_| {
+            view_range.set((0.0, TIMELINE_VB_W as f64));
+            || ()
+        });
+    }
     // Yew 0.21 はイベント委譲を使うため e.current_target() が配信先になる。
     // 実際のオーバーレイ要素の rect を得るには NodeRef 経由で参照する。
     let overlay_ref = use_node_ref();
 
     // mouse 座標 → (lane_idx, nearest packet) を解決する共通ロジック。
-    // data, mouse の情報から HoverInfo を返す。該当なしなら None。
-    let resolve = |e: &MouseEvent, data: &TimelineData, overlay: &NodeRef| -> Option<HoverInfo> {
+    // view_range は (view_start, view_end) で、viewBox x の可視範囲。
+    let resolve = |e: &MouseEvent,
+                   data: &TimelineData,
+                   overlay: &NodeRef,
+                   view: (f64, f64)|
+     -> Option<HoverInfo> {
         if data.lanes.is_empty() {
             return None;
         }
@@ -477,7 +491,12 @@ fn TimelineView(props: &TimelineViewProps) -> Html {
         let frac_y = oy / h;
         let lane_count = data.lanes.len();
         let lane_idx = ((frac_y * lane_count as f64) as usize).min(lane_count - 1);
-        let time = (frac_x * data.duration_ms as f64).round() as u32;
+        let (vs, ve) = view;
+        let x_svg = vs + frac_x * (ve - vs);
+        let dur = data.duration_ms as f64;
+        let time = ((x_svg / TIMELINE_VB_W as f64) * dur)
+            .round()
+            .clamp(0.0, u32::MAX as f64) as u32;
         let lane = &data.lanes[lane_idx];
         if lane.ticks.is_empty() {
             return None;
@@ -504,7 +523,7 @@ fn TimelineView(props: &TimelineViewProps) -> Html {
         let (tt, pi) = lane.ticks[i];
         Some(HoverInfo {
             lane_idx,
-            x_svg: frac_x * TIMELINE_VB_W as f64,
+            x_svg,
             tick_time: tt,
             packet_index: pi,
             px_x: ox as i32,
@@ -516,8 +535,9 @@ fn TimelineView(props: &TimelineViewProps) -> Html {
         let hover = hover.clone();
         let data = data.clone();
         let overlay_ref = overlay_ref.clone();
+        let view_range = view_range.clone();
         Callback::from(move |e: MouseEvent| {
-            hover.set(resolve(&e, &data, &overlay_ref));
+            hover.set(resolve(&e, &data, &overlay_ref, *view_range));
         })
     };
     let onmouseleave = {
@@ -528,9 +548,62 @@ fn TimelineView(props: &TimelineViewProps) -> Html {
         let data = data.clone();
         let on_jump = props.on_jump.clone();
         let overlay_ref = overlay_ref.clone();
+        let view_range = view_range.clone();
         Callback::from(move |e: MouseEvent| {
-            if let Some(info) = resolve(&e, &data, &overlay_ref) {
+            if let Some(info) = resolve(&e, &data, &overlay_ref, *view_range) {
                 on_jump.emit(info.packet_index);
+            }
+        })
+    };
+    // ホイール: ズーム (カーソル中心)、Shift+ホイール: 左右パン。
+    let onwheel = {
+        let view_range = view_range.clone();
+        let overlay_ref = overlay_ref.clone();
+        Callback::from(move |e: WheelEvent| {
+            e.prevent_default();
+            let Some(el) = overlay_ref.cast::<Element>() else {
+                return;
+            };
+            let rect = el.get_bounding_client_rect();
+            let w = rect.width();
+            if w <= 0.0 {
+                return;
+            }
+            let (vs, ve) = *view_range;
+            let vw = ve - vs;
+            let dy = e.delta_y();
+            let max_vb = TIMELINE_VB_W as f64;
+            let (mut new_vs, mut new_ve) = if e.shift_key() {
+                // パン量はピクセルを viewBox 単位に変換。
+                let shift = dy * vw / w;
+                (vs + shift, ve + shift)
+            } else {
+                let ox = (e.client_x() as f64 - rect.left()).clamp(0.0, w);
+                let anchor = vs + (ox / w) * vw;
+                // dy > 0 (下スクロール) = 縮小、< 0 = 拡大。
+                let factor = if dy > 0.0 { 1.25 } else { 0.8 };
+                // 最小幅は 1px あたり最低 0.1 viewBox 単位 (= 10x ズーム上限)。
+                let min_vw = (max_vb / w).max(0.1);
+                let new_vw = (vw * factor).clamp(min_vw, max_vb);
+                let frac = if vw > 0.0 { (anchor - vs) / vw } else { 0.5 };
+                let s = anchor - frac * new_vw;
+                (s, s + new_vw)
+            };
+            // 0..max_vb にクランプ。新しい幅は超えないように先に保全。
+            let new_vw = (new_ve - new_vs).min(max_vb).max(0.1);
+            if new_vs < 0.0 {
+                new_vs = 0.0;
+                new_ve = new_vs + new_vw;
+            }
+            if new_ve > max_vb {
+                new_ve = max_vb;
+                new_vs = new_ve - new_vw;
+            }
+            if new_vs < 0.0 {
+                new_vs = 0.0;
+            }
+            if (new_vs - vs).abs() > 1e-6 || (new_ve - ve).abs() > 1e-6 {
+                view_range.set((new_vs, new_ve));
             }
         })
     };
@@ -547,7 +620,9 @@ fn TimelineView(props: &TimelineViewProps) -> Html {
     }
 
     let vb_h = data.vb_h;
-    let viewbox = format!("0 0 {} {}", TIMELINE_VB_W, vb_h);
+    let (vs, ve) = *view_range;
+    let vw = (ve - vs).max(0.1);
+    let viewbox = format!("{vs:.4} 0 {vw:.4} {vb_h}");
     let svg_height_px = vb_h as usize * 2; // 1 lane = 28 → 56px 程度確保。
 
     // レーンの背景 + パケット tick path を描画。
@@ -577,11 +652,12 @@ fn TimelineView(props: &TimelineViewProps) -> Html {
         })
         .collect::<Html>();
 
-    // 時刻目盛り (5 本)。
+    // 時刻目盛り (5 本)。view_range に従って表示範囲を示す。
     let axis_ticks = (0..=4)
         .map(|i| {
             let frac = i as f64 / 4.0;
-            let ms = (frac * data.duration_ms as f64) as u64;
+            let x_vb = vs + frac * vw;
+            let ms = (x_vb / TIMELINE_VB_W as f64 * data.duration_ms as f64).max(0.0) as u64;
             html! {
                 <div class="text-xs font-mono text-base-content/60 whitespace-nowrap">
                     { fmt_ms(ms) }
@@ -638,7 +714,7 @@ fn TimelineView(props: &TimelineViewProps) -> Html {
                 <div class="flex items-center justify-between flex-wrap gap-2">
                     <h2 class="card-title">{ "Timeline" }</h2>
                     <span class="text-xs text-base-content/60">
-                        { "クリックで該当パケットへジャンプ" }
+                        { "クリックでジャンプ / ホイールでズーム / Shift+ホイールで左右移動" }
                     </span>
                 </div>
 
@@ -650,9 +726,11 @@ fn TimelineView(props: &TimelineViewProps) -> Html {
                     <div class="flex-1 min-w-0">
                         <div ref={overlay_ref}
                             class="relative"
+                            style="touch-action: none; overscroll-behavior: contain;"
                             onmousemove={onmousemove}
                             onmouseleave={onmouseleave}
-                            onclick={onclick}>
+                            onclick={onclick}
+                            onwheel={onwheel}>
                             <svg
                                 viewBox={viewbox}
                                 preserveAspectRatio="none"
