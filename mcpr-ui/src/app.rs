@@ -8,7 +8,6 @@ use mcpr_lib::{
     archive::zip::ZipArchiveReader,
     mcpr::{MetaData, ReplayReader, State},
 };
-use web_sys::wasm_bindgen::JsCast;
 use web_sys::{DragEvent, Element, Event, HtmlInputElement, MouseEvent};
 use yew::prelude::*;
 
@@ -452,17 +451,18 @@ fn TimelineView(props: &TimelineViewProps) -> Html {
         })
     };
     let hover = use_state(|| Option::<HoverInfo>::None);
+    // Yew 0.21 はイベント委譲を使うため e.current_target() が配信先になる。
+    // 実際のオーバーレイ要素の rect を得るには NodeRef 経由で参照する。
+    let overlay_ref = use_node_ref();
 
     // mouse 座標 → (lane_idx, nearest packet) を解決する共通ロジック。
     // data, mouse の情報から HoverInfo を返す。該当なしなら None。
-    // offset_x/y は event.target (SVG 内部の path 等) 基準で崩れるため、
-    // currentTarget の getBoundingClientRect と client_x/y を使う。
-    let resolve = |e: &MouseEvent, data: &TimelineData| -> Option<HoverInfo> {
+    let resolve = |e: &MouseEvent, data: &TimelineData, overlay: &NodeRef| -> Option<HoverInfo> {
         if data.lanes.is_empty() {
             return None;
         }
-        let target = e.current_target()?.dyn_into::<Element>().ok()?;
-        let rect = target.get_bounding_client_rect();
+        let el = overlay.cast::<Element>()?;
+        let rect = el.get_bounding_client_rect();
         let w = rect.width();
         let h = rect.height();
         if w <= 0.0 || h <= 0.0 {
@@ -515,8 +515,9 @@ fn TimelineView(props: &TimelineViewProps) -> Html {
     let onmousemove = {
         let hover = hover.clone();
         let data = data.clone();
+        let overlay_ref = overlay_ref.clone();
         Callback::from(move |e: MouseEvent| {
-            hover.set(resolve(&e, &data));
+            hover.set(resolve(&e, &data, &overlay_ref));
         })
     };
     let onmouseleave = {
@@ -526,8 +527,9 @@ fn TimelineView(props: &TimelineViewProps) -> Html {
     let onclick = {
         let data = data.clone();
         let on_jump = props.on_jump.clone();
+        let overlay_ref = overlay_ref.clone();
         Callback::from(move |e: MouseEvent| {
-            if let Some(info) = resolve(&e, &data) {
+            if let Some(info) = resolve(&e, &data, &overlay_ref) {
                 on_jump.emit(info.packet_index);
             }
         })
@@ -646,7 +648,8 @@ fn TimelineView(props: &TimelineViewProps) -> Html {
                     </div>
 
                     <div class="flex-1 min-w-0">
-                        <div class="relative"
+                        <div ref={overlay_ref}
+                            class="relative"
                             onmousemove={onmousemove}
                             onmouseleave={onmouseleave}
                             onclick={onclick}>
