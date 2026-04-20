@@ -455,23 +455,26 @@ fn TimelineView(props: &TimelineViewProps) -> Html {
 
     // mouse 座標 → (lane_idx, nearest packet) を解決する共通ロジック。
     // data, mouse の情報から HoverInfo を返す。該当なしなら None。
+    // offset_x/y は event.target (SVG 内部の path 等) 基準で崩れるため、
+    // currentTarget の getBoundingClientRect と client_x/y を使う。
     let resolve = |e: &MouseEvent, data: &TimelineData| -> Option<HoverInfo> {
         if data.lanes.is_empty() {
             return None;
         }
         let target = e.current_target()?.dyn_into::<Element>().ok()?;
-        let w = target.client_width();
-        let h = target.client_height();
-        if w <= 0 || h <= 0 {
+        let rect = target.get_bounding_client_rect();
+        let w = rect.width();
+        let h = rect.height();
+        if w <= 0.0 || h <= 0.0 {
             return None;
         }
-        let ox = e.offset_x();
-        let oy = e.offset_y();
-        if ox < 0 || oy < 0 || ox > w || oy > h {
+        let ox = e.client_x() as f64 - rect.left();
+        let oy = e.client_y() as f64 - rect.top();
+        if ox < 0.0 || oy < 0.0 || ox > w || oy > h {
             return None;
         }
-        let frac_x = (ox as f64) / (w as f64);
-        let frac_y = (oy as f64) / (h as f64);
+        let frac_x = ox / w;
+        let frac_y = oy / h;
         let lane_count = data.lanes.len();
         let lane_idx = ((frac_y * lane_count as f64) as usize).min(lane_count - 1);
         let time = (frac_x * data.duration_ms as f64).round() as u32;
@@ -504,8 +507,8 @@ fn TimelineView(props: &TimelineViewProps) -> Html {
             x_svg: frac_x * TIMELINE_VB_W as f64,
             tick_time: tt,
             packet_index: pi,
-            px_x: ox,
-            px_y: oy,
+            px_x: ox as i32,
+            px_y: oy as i32,
         })
     };
 
