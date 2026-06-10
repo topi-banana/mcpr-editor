@@ -133,14 +133,13 @@ impl MetaData {
                 .collect();
             digits.parse().unwrap_or(u64::MAX)
         }
-        names.sort_by(|a, b| {
-            numeric_key(a)
-                .cmp(&numeric_key(b))
-                .then_with(|| a.cmp(b))
-        });
+        names.sort_by(|a, b| numeric_key(a).cmp(&numeric_key(b)).then_with(|| a.cmp(b)));
         names.into_iter().cloned().collect()
     }
 }
+
+/// アーカイブ内のメタデータファイル名 (フォーマット判別の根拠でもある)。
+pub const METADATA_FILE: &str = "metadata.json";
 
 /// flashback chunk ファイル先頭 i32 (big-endian)。
 pub const MAGIC_NUMBER: i32 = -679417724;
@@ -240,14 +239,32 @@ impl<W: Write> ChunkWriter<W> {
         Ok(Self { writer, index })
     }
     pub fn push(&mut self, action: &Action) -> anyhow::Result<()> {
+        self.write_action(&action.kind, &action.data, &[])
+    }
+    /// パケット action (`VarInt packet id` + body) を結合バッファなしで書く。
+    pub fn push_packet(
+        &mut self,
+        kind: &ActionKind,
+        packet_id: i32,
+        body: &[u8],
+    ) -> anyhow::Result<()> {
+        let mut head = [0u8; 5];
+        let mut cursor = Cursor::new(&mut head[..]);
+        cursor.write_varint(packet_id)?;
+        let head_len = cursor.position() as usize;
+        self.write_action(kind, &head[..head_len], body)
+    }
+    /// action data を 2 スライスの連結として書く。
+    fn write_action(&mut self, kind: &ActionKind, head: &[u8], tail: &[u8]) -> anyhow::Result<()> {
         let id = self
             .index
-            .get(&action.kind)
-            .ok_or_else(|| anyhow::anyhow!("action {:?} not in registry", action.kind))?;
+            .get(kind)
+            .ok_or_else(|| anyhow::anyhow!("action {:?} not in registry", kind))?;
         self.writer.write_varint(*id as i32)?;
         self.writer
-            .write_all(&(action.data.len() as i32).to_be_bytes())?;
-        self.writer.write_all(&action.data)?;
+            .write_all(&((head.len() + tail.len()) as i32).to_be_bytes())?;
+        self.writer.write_all(head)?;
+        self.writer.write_all(tail)?;
         Ok(())
     }
     /// バッファをフラッシュして内部 writer を返す。
@@ -266,7 +283,7 @@ impl<R: ArchiveReader> FlashbackReader<R> {
         Self { reader }
     }
     pub fn get_metadata(&mut self) -> anyhow::Result<MetaData> {
-        let reader = BufReader::new(self.reader.get_reader("metadata.json")?);
+        let reader = BufReader::new(self.reader.get_reader(METADATA_FILE)?);
         let metadata = serde_json::from_reader(reader)?;
         Ok(metadata)
     }
@@ -305,8 +322,7 @@ impl<R: ArchiveReader> FlashbackReader<R> {
             current: None,
             tick: 0,
             chunk_caches: HashMap::new(),
-            include_snapshot,
-            opened_any_chunk: false,
+            snapshot_pending: include_snapshot,
         })
     }
 }
@@ -316,6 +332,9 @@ struct CurrentChunk {
     /// 流すべき snapshot の残り。読み終わったら None。
     snapshot: Option<Cursor<Vec<u8>>>,
 }
+
+/// パケットの (id, body) 分解表現。
+type PacketParts = (i32, Box<[u8]>);
 
 /// Flashback リプレイを論理イベント列として読み出すアダプタ。
 ///
@@ -331,10 +350,10 @@ pub struct FlashbackEventSource<R: ArchiveReader> {
     pending_chunks: VecDeque<String>,
     current: Option<CurrentChunk>,
     tick: u64,
-    /// cache_index → エントリ (VarInt packet id + body) の列
-    chunk_caches: HashMap<u32, Vec<Box<[u8]>>>,
-    include_snapshot: bool,
-    opened_any_chunk: bool,
+    /// cache_index → エントリ (packet id, body) の列
+    chunk_caches: HashMap<u32, Vec<PacketParts>>,
+    /// 最初の chunk の snapshot をまだ流すべきか。消費したら false。
+    snapshot_pending: bool,
 }
 
 impl<R: ArchiveReader> FlashbackEventSource<R> {
@@ -347,9 +366,10 @@ impl<R: ArchiveReader> FlashbackEventSource<R> {
                 };
                 let bytes = self.reader.read_file_fully(&name)?;
                 let reader = ChunkReader::new(Cursor::new(bytes))?;
-                let snapshot = (self.include_snapshot && !self.opened_any_chunk)
+                let snapshot = self
+                    .snapshot_pending
                     .then(|| Cursor::new(reader.snapshot().to_vec()));
-                self.opened_any_chunk = true;
+                self.snapshot_pending = false;
                 self.current = Some(CurrentChunk { reader, snapshot });
             }
             let current = self.current.as_mut().unwrap();
@@ -373,8 +393,8 @@ impl<R: ArchiveReader> FlashbackEventSource<R> {
     }
 
     /// `level_chunk_caches` からグローバル index のチャンクパケット
-    /// (VarInt packet id + body) を引く。
-    fn cached_chunk_payload(&mut self, index: u32) -> anyhow::Result<Box<[u8]>> {
+    /// (packet id, body) を引く。
+    fn cached_chunk_packet(&mut self, index: u32) -> anyhow::Result<PacketParts> {
         let cache_index = index / CHUNK_CACHE_SIZE;
         let offset = (index % CHUNK_CACHE_SIZE) as usize;
         if !self.chunk_caches.contains_key(&cache_index) {
@@ -383,7 +403,7 @@ impl<R: ArchiveReader> FlashbackEventSource<R> {
         }
         self.chunk_caches[&cache_index]
             .get(offset)
-            .cloned()
+            .map(|(id, body)| (*id, body.clone()))
             .ok_or_else(|| {
                 anyhow::anyhow!(
                     "cached chunk index {} not found (cache file {} has fewer entries)",
@@ -394,9 +414,9 @@ impl<R: ArchiveReader> FlashbackEventSource<R> {
     }
 
     /// `level_chunk_caches/<N>` を読み、`i32 BE size` + データの連結を
-    /// エントリ列に分割する。N=0 で存在しない場合は旧形式の
-    /// 単一ファイル `level_chunk_cache` にフォールバックする。
-    fn load_chunk_cache(&mut self, cache_index: u32) -> anyhow::Result<Vec<Box<[u8]>>> {
+    /// (packet id, body) のエントリ列に分割する。N=0 で存在しない場合は
+    /// 旧形式の単一ファイル `level_chunk_cache` にフォールバックする。
+    fn load_chunk_cache(&mut self, cache_index: u32) -> anyhow::Result<Vec<PacketParts>> {
         let bytes = match self
             .reader
             .read_file_fully(&format!("level_chunk_caches/{}", cache_index))
@@ -421,7 +441,7 @@ impl<R: ArchiveReader> FlashbackEventSource<R> {
             }
             let mut data = vec![0u8; size as usize];
             cursor.read_exact(&mut data)?;
-            entries.push(data.into_boxed_slice());
+            entries.push(split_packet_payload(&data)?);
         }
         Ok(entries)
     }
@@ -457,8 +477,7 @@ impl<R: ArchiveReader> FlashbackEventSource<R> {
                 if index < 0 {
                     anyhow::bail!("negative level_chunk_cached index: {}", index);
                 }
-                let payload = self.cached_chunk_payload(index as u32)?;
-                let (id, data) = split_packet_payload(&payload)?;
+                let (id, data) = self.cached_chunk_packet(index as u32)?;
                 Ok(Some(Event::Packet {
                     time,
                     state: State::Play,
@@ -479,7 +498,7 @@ impl<R: ArchiveReader> FlashbackEventSource<R> {
 }
 
 /// パケットペイロード (`VarInt packet id` + body) を分解する。
-fn split_packet_payload(payload: &[u8]) -> anyhow::Result<(i32, Box<[u8]>)> {
+fn split_packet_payload(payload: &[u8]) -> anyhow::Result<PacketParts> {
     let mut cursor = Cursor::new(payload);
     let id = cursor.read_varint()?;
     let body_start = cursor.position() as usize;
@@ -511,7 +530,7 @@ impl<W: ArchiveWriter> FlashbackWriter<W> {
         Self { writer }
     }
     pub fn write_metadata(&mut self, metadata: &MetaData) -> anyhow::Result<()> {
-        let writer = BufWriter::new(self.writer.get_writer("metadata.json")?);
+        let writer = BufWriter::new(self.writer.get_writer(METADATA_FILE)?);
         serde_json::to_writer(writer, metadata)?;
         Ok(())
     }
@@ -545,20 +564,18 @@ impl<W: ArchiveWriter> FlashbackWriter<W> {
 /// (Flashback mod 側での再生可否は data_version に依存しうる)。
 pub struct FlashbackEventSink<W: ArchiveWriter> {
     archive: W,
+    /// [`EventSink::finish`] が取り出すまで Some。
     chunk: Option<ChunkWriter<Vec<u8>>>,
     tick: u64,
     uuid: uuid::Uuid,
     skipped_packets: usize,
     skipped_customs: usize,
-    finished: bool,
 }
 
 impl<W: ArchiveWriter> FlashbackEventSink<W> {
-    pub fn new(archive: W) -> anyhow::Result<Self> {
-        Self::with_uuid(archive, uuid::Uuid::new_v4())
-    }
-    /// metadata.json に書くリプレイ uuid を指定する。
-    pub fn with_uuid(archive: W, uuid: uuid::Uuid) -> anyhow::Result<Self> {
+    /// `uuid` は metadata.json に書くリプレイ uuid
+    /// (乱数源の選択は呼び出し側の責務)。
+    pub fn new(archive: W, uuid: uuid::Uuid) -> anyhow::Result<Self> {
         let chunk = ChunkWriter::new(Vec::new(), &ActionKind::KNOWN, &[])?;
         Ok(Self {
             archive,
@@ -567,7 +584,6 @@ impl<W: ArchiveWriter> FlashbackEventSink<W> {
             uuid,
             skipped_packets: 0,
             skipped_customs: 0,
-            finished: false,
         })
     }
     /// 対応 action が無くスキップした非 Play/Configuration パケット数。
@@ -582,11 +598,18 @@ impl<W: ArchiveWriter> FlashbackEventSink<W> {
         self.archive
     }
 
+    /// finish 前の chunk writer。finish 後の push は契約違反 (panic)。
+    fn chunk(&mut self) -> &mut ChunkWriter<Vec<u8>> {
+        self.chunk
+            .as_mut()
+            .expect("FlashbackEventSink already finished")
+    }
+
     /// `target` tick まで `NextTick` を合成する。過去の時刻は現 tick に丸める。
     fn advance_tick(&mut self, target: u64) -> anyhow::Result<()> {
-        let chunk = self.chunk.as_mut().expect("not finished");
         while self.tick < target {
-            chunk.push(&Action::new(ActionKind::NextTick, Box::new([])))?;
+            self.chunk()
+                .push(&Action::new(ActionKind::NextTick, Box::new([])))?;
             self.tick += 1;
         }
         Ok(())
@@ -611,13 +634,7 @@ impl<W: ArchiveWriter> EventSink for FlashbackEventSink<W> {
                     }
                 };
                 self.advance_tick(time.as_ticks())?;
-                let mut payload = Vec::with_capacity(data.len() + 5);
-                payload.write_varint(id)?;
-                payload.extend_from_slice(&data);
-                self.chunk
-                    .as_mut()
-                    .expect("not finished")
-                    .push(&Action::new(kind, payload.into()))?;
+                self.chunk().push_packet(&kind, id, &data)?;
             }
             Event::Custom { time, name, data } => {
                 let kind = ActionKind::parse(&name);
@@ -626,19 +643,15 @@ impl<W: ArchiveWriter> EventSink for FlashbackEventSink<W> {
                     return Ok(());
                 }
                 self.advance_tick(time.as_ticks())?;
-                self.chunk
-                    .as_mut()
-                    .expect("not finished")
-                    .push(&Action::new(kind, data))?;
+                self.chunk().push(&Action::new(kind, data))?;
             }
         }
         Ok(())
     }
     fn finish(&mut self, info: &ReplayInfo) -> anyhow::Result<()> {
-        if self.finished {
+        if self.chunk.is_none() {
             anyhow::bail!("FlashbackEventSink::finish called twice");
         }
-        self.finished = true;
 
         // 末尾まで時間を進める (duration が tick 数の根拠になる)
         let total_ticks = self
@@ -646,7 +659,7 @@ impl<W: ArchiveWriter> EventSink for FlashbackEventSink<W> {
             .max(Time::from_millis(info.duration_ms).as_ticks());
         self.advance_tick(total_ticks)?;
 
-        let bytes = self.chunk.take().expect("not finished").finish()?;
+        let bytes = self.chunk.take().unwrap().finish()?;
         {
             let mut writer = self.archive.get_writer("c0.flashback")?;
             writer.write_all(&bytes)?;
@@ -670,7 +683,7 @@ impl<W: ArchiveWriter> EventSink for FlashbackEventSink<W> {
                 },
             )]),
         };
-        let writer = BufWriter::new(self.archive.get_writer("metadata.json")?);
+        let writer = BufWriter::new(self.archive.get_writer(METADATA_FILE)?);
         serde_json::to_writer(writer, &metadata)?;
         Ok(())
     }
@@ -784,29 +797,7 @@ mod tests {
         );
     }
 
-    /// テスト用のメモリ上アーカイブ。
-    #[derive(Default)]
-    struct MemArchive(HashMap<String, Vec<u8>>);
-    impl ArchiveReader for MemArchive {
-        fn get_reader<'this>(
-            &'this mut self,
-            filename: &str,
-        ) -> anyhow::Result<Box<dyn Read + 'this>> {
-            let data = self
-                .0
-                .get(filename)
-                .ok_or_else(|| anyhow::anyhow!("no such file: {}", filename))?;
-            Ok(Box::new(Cursor::new(data.clone())))
-        }
-    }
-    impl ArchiveWriter for MemArchive {
-        fn get_writer<'this>(
-            &'this mut self,
-            filename: &str,
-        ) -> anyhow::Result<Box<dyn Write + 'this>> {
-            Ok(Box::new(self.0.entry(filename.to_string()).or_default()))
-        }
-    }
+    use crate::archive::testing::MemArchive;
 
     /// パケットペイロード (VarInt id + body) を組み立てる。
     fn payload(id: i32, body: &[u8]) -> Vec<u8> {
@@ -864,23 +855,19 @@ mod tests {
             ))
             .unwrap();
             // tick 1: cache 参照 (index 1) + 独自 action
-            w.push(&Action::new(ActionKind::NextTick, Box::new([]))).unwrap();
-            w.push(&Action::new(
-                ActionKind::LevelChunkCached,
-                {
-                    let mut buf = Vec::new();
-                    buf.write_varint(1).unwrap();
-                    buf.into()
-                },
-            ))
+            w.push(&Action::new(ActionKind::NextTick, Box::new([])))
+                .unwrap();
+            w.push(&Action::new(ActionKind::LevelChunkCached, {
+                let mut buf = Vec::new();
+                buf.write_varint(1).unwrap();
+                buf.into()
+            }))
             .unwrap();
-            w.push(&Action::new(
-                ActionKind::MoveEntities,
-                vec![9, 9].into(),
-            ))
-            .unwrap();
+            w.push(&Action::new(ActionKind::MoveEntities, vec![9, 9].into()))
+                .unwrap();
             // tick 2: game packet
-            w.push(&Action::new(ActionKind::NextTick, Box::new([]))).unwrap();
+            w.push(&Action::new(ActionKind::NextTick, Box::new([])))
+                .unwrap();
             w.push(&Action::new(
                 ActionKind::GamePacket,
                 payload(0x60, &[6]).into(),
@@ -897,14 +884,8 @@ mod tests {
         MemArchive(files)
     }
 
-    fn collect_events<R: ArchiveReader>(
-        mut source: FlashbackEventSource<R>,
-    ) -> Vec<Event> {
-        let mut events = Vec::new();
-        while let Some(event) = source.next_event().unwrap() {
-            events.push(event);
-        }
-        events
+    fn collect_events<R: ArchiveReader>(mut source: FlashbackEventSource<R>) -> Vec<Event> {
+        source.events().collect::<anyhow::Result<_>>().unwrap()
     }
 
     #[test]
@@ -1056,8 +1037,7 @@ mod tests {
             },
         ];
 
-        let mut sink =
-            FlashbackEventSink::with_uuid(MemArchive::default(), uuid::Uuid::nil()).unwrap();
+        let mut sink = FlashbackEventSink::new(MemArchive::default(), uuid::Uuid::nil()).unwrap();
         for event in events.clone() {
             sink.push(event).unwrap();
         }
@@ -1096,8 +1076,7 @@ mod tests {
 
     #[test]
     fn event_sink_synthesizes_next_ticks() {
-        let mut sink =
-            FlashbackEventSink::with_uuid(MemArchive::default(), uuid::Uuid::nil()).unwrap();
+        let mut sink = FlashbackEventSink::new(MemArchive::default(), uuid::Uuid::nil()).unwrap();
         // 130ms → tick 2 (切り捨て)
         sink.push(Event::Packet {
             time: Time::from_millis(130),

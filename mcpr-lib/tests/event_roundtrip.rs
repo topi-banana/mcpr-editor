@@ -20,11 +20,7 @@ fn play_packet(time_ms: u64, id: i32, data: &[u8]) -> Event {
 }
 
 fn drain<S: EventSource>(source: &mut S) -> Vec<Event> {
-    let mut events = Vec::new();
-    while let Some(event) = source.next_event().unwrap() {
-        events.push(event);
-    }
-    events
+    source.events().collect::<anyhow::Result<_>>().unwrap()
 }
 
 fn test_info() -> ReplayInfo {
@@ -56,7 +52,7 @@ fn mcpr_to_flashback_to_mcpr() {
     let mut zip_buf = Cursor::new(Vec::new());
     {
         let archive = ZipArchiveWriter::new(&mut zip_buf, None);
-        let mut sink = FlashbackEventSink::new(archive).unwrap();
+        let mut sink = FlashbackEventSink::new(archive, uuid::Uuid::nil()).unwrap();
         for event in source_events.clone() {
             sink.push(event).unwrap();
         }
@@ -165,14 +161,24 @@ fn real_flashback_to_mcpr() {
     // 先頭は合成 Login Success、以降に configuration と play が続く
     assert!(matches!(
         &events[0],
-        Event::Packet { state: State::Login, id: 0x02, .. }
+        Event::Packet {
+            state: State::Login,
+            id: 0x02,
+            ..
+        }
     ));
     assert!(events.iter().any(|e| matches!(
         e,
-        Event::Packet { state: State::Configuration, .. }
+        Event::Packet {
+            state: State::Configuration,
+            ..
+        }
     )));
     assert!(events.iter().any(|e| matches!(
         e,
-        Event::Packet { state: State::Play, .. }
+        Event::Packet {
+            state: State::Play,
+            ..
+        }
     )));
 }

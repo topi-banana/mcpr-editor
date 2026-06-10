@@ -6,34 +6,43 @@ use gloo_file::{
 };
 use mcpr_lib::{
     archive::zip::ZipArchiveReader,
-    mcpr::{MetaData, ReplayReader, State},
+    event::{Event as ReplayEvent, EventSource, ReplayFormat, ReplayInfo, State, detect_format},
+    flashback::FlashbackReader,
+    mcpr::ReplayReader,
 };
 use web_sys::{DragEvent, Event, HtmlInputElement};
 use yew::prelude::*;
 
 const PAGE_SIZE: usize = 200;
 
+/// 表示行のイベント種別。論理イベント層の [`ReplayEvent`] のうち
+/// 表示に必要な部分のみを保持する。
 #[derive(Clone, PartialEq)]
-pub struct PacketRow {
-    pub index: usize,
-    pub time: u32,
-    pub id: i32,
+pub enum RowKind {
+    Packet { id: i32, state: State },
+    Custom { name: String },
+}
+
+#[derive(Clone, PartialEq)]
+pub struct EventRow {
+    pub time_ms: u64,
+    pub kind: RowKind,
     pub size: usize,
-    pub state: &'static str,
 }
 
 #[derive(Clone, PartialEq)]
 pub struct Loaded {
     pub filename: String,
-    pub metadata: MetaData,
-    pub packets: Rc<[PacketRow]>,
+    pub format: &'static str,
+    pub info: ReplayInfo,
+    pub events: Rc<Vec<EventRow>>,
 }
 
 #[derive(Clone, PartialEq)]
 pub enum ViewState {
     Idle,
     Loading(String),
-    // Loaded は MetaData を持ち大きいので Box で包む。
+    // Loaded は他 variant より大きいので Box で包む。
     Loaded(Box<Loaded>),
     Error(String),
 }
@@ -48,22 +57,49 @@ fn state_name(s: State) -> &'static str {
     }
 }
 
-fn parse_replay(bytes: Vec<u8>) -> anyhow::Result<(MetaData, Vec<PacketRow>)> {
-    let zip = ZipArchiveReader::new(Cursor::new(bytes))?;
-    let mut replay = ReplayReader::new(zip);
-    let metadata = replay.read_metadata()?;
-    let packets: Vec<PacketRow> = replay
-        .get_packet_reader()?
-        .enumerate()
-        .map(|(i, (st, p))| PacketRow {
-            index: i,
-            time: p.time(),
-            id: p.id(),
-            size: p.data().len(),
-            state: state_name(st),
+/// 論理イベント列を表示用の行へ読み出す。
+fn collect_events<S: EventSource>(mut source: S) -> anyhow::Result<(ReplayInfo, Vec<EventRow>)> {
+    let info = source.info().clone();
+    let rows = source
+        .events()
+        .map(|event| {
+            event.map(|event| {
+                let (time, kind, size) = match event {
+                    ReplayEvent::Packet {
+                        time,
+                        state,
+                        id,
+                        data,
+                    } => (time, RowKind::Packet { id, state }, data.len()),
+                    ReplayEvent::Custom { time, name, data } => {
+                        (time, RowKind::Custom { name }, data.len())
+                    }
+                };
+                EventRow {
+                    time_ms: time.as_millis(),
+                    kind,
+                    size,
+                }
+            })
         })
-        .collect();
-    Ok((metadata, packets))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok((info, rows))
+}
+
+fn parse_replay(bytes: Vec<u8>) -> anyhow::Result<(&'static str, ReplayInfo, Vec<EventRow>)> {
+    let mut zip = ZipArchiveReader::new(Cursor::new(bytes))?;
+    let format = detect_format(&mut zip)?;
+    // McprEventSource は reader を借用するため、match の外で生かす
+    let mut mcpr_reader;
+    let source: Box<dyn EventSource + '_> = match format {
+        ReplayFormat::ReplayMod => {
+            mcpr_reader = ReplayReader::new(zip);
+            Box::new(mcpr_reader.event_source()?)
+        }
+        ReplayFormat::Flashback => Box::new(FlashbackReader::new(zip).event_source(true)?),
+    };
+    let (info, rows) = collect_events(source)?;
+    Ok((format.name(), info, rows))
 }
 
 #[function_component]
@@ -84,11 +120,14 @@ pub fn App() -> Html {
                 *slot.borrow_mut() = None;
                 match result {
                     Ok(bytes) => match parse_replay(bytes) {
-                        Ok((metadata, packets)) => state.set(ViewState::Loaded(Box::new(Loaded {
-                            filename,
-                            metadata,
-                            packets: Rc::from(packets),
-                        }))),
+                        Ok((format, info, events)) => {
+                            state.set(ViewState::Loaded(Box::new(Loaded {
+                                filename,
+                                format,
+                                info,
+                                events: Rc::new(events),
+                            })))
+                        }
                         Err(e) => state.set(ViewState::Error(format!("parse error: {e}"))),
                     },
                     Err(e) => state.set(ViewState::Error(format!("read error: {e:?}"))),
@@ -141,8 +180,8 @@ pub fn App() -> Html {
                     ondragover={on_dragover}
                     ondrop={on_drop_handler}>
                     <div class="card-body items-center text-center gap-3">
-                        <p class="text-base-content/70">{ ".mcpr ファイルをドロップ、または" }</p>
-                        <input type="file" accept=".mcpr"
+                        <p class="text-base-content/70">{ ".mcpr / Flashback (.zip) ファイルをドロップ、または" }</p>
+                        <input type="file" accept=".mcpr,.zip"
                             class="file-input file-input-bordered w-full max-w-xs"
                             onchange={on_input_change} />
                     </div>
@@ -178,7 +217,7 @@ struct LoadedViewProps {
 #[function_component]
 fn LoadedView(props: &LoadedViewProps) -> Html {
     let page = use_state(|| 0usize);
-    let total = props.data.packets.len();
+    let total = props.data.events.len();
     let total_pages = total.div_ceil(PAGE_SIZE).max(1);
     let cur_page = (*page).min(total_pages - 1);
     let start = cur_page * PAGE_SIZE;
@@ -201,16 +240,27 @@ fn LoadedView(props: &LoadedViewProps) -> Html {
         })
     };
 
-    let rows = props.data.packets[start..end]
+    let rows = props.data.events[start..end]
         .iter()
-        .map(|p| {
+        .enumerate()
+        .map(|(i, row)| {
+            let (event, state) = match &row.kind {
+                RowKind::Packet { id, state } => (
+                    html! { <code>{ format!("0x{id:02x}") }</code> },
+                    html! { <span class="badge badge-ghost badge-sm">{ state_name(*state) }</span> },
+                ),
+                RowKind::Custom { name } => (
+                    html! { <code>{ name.clone() }</code> },
+                    html! { <span class="text-base-content/40">{ "—" }</span> },
+                ),
+            };
             html! {
                 <tr>
-                    <td>{ p.index }</td>
-                    <td>{ p.time }</td>
-                    <td><code>{ format!("0x{:02x}", p.id) }</code></td>
-                    <td><span class="badge badge-ghost badge-sm">{ p.state }</span></td>
-                    <td>{ p.size }</td>
+                    <td>{ start + i }</td>
+                    <td>{ row.time_ms }</td>
+                    <td>{ event }</td>
+                    <td>{ state }</td>
+                    <td>{ row.size }</td>
                 </tr>
             }
         })
@@ -223,13 +273,15 @@ fn LoadedView(props: &LoadedViewProps) -> Html {
                     <h2 class="card-title">{ "Metadata" }</h2>
                     <div class="grid grid-cols-1 sm:grid-cols-2 gap-y-1 gap-x-6 text-sm">
                         <MetaRow label="File" value={props.data.filename.clone()} />
-                        <MetaRow label="mcversion" value={props.data.metadata.mcversion.clone()} />
-                        <MetaRow label="protocol" value={props.data.metadata.protocol.to_string()} />
-                        <MetaRow label="duration (ms)" value={props.data.metadata.duration.to_string()} />
-                        <MetaRow label="serverName" value={props.data.metadata.serverName.clone()} />
-                        <MetaRow label="singleplayer" value={props.data.metadata.singleplayer.to_string()} />
-                        <MetaRow label="players" value={props.data.metadata.players.len().to_string()} />
-                        <MetaRow label="packets" value={total.to_string()} />
+                        <MetaRow label="format" value={props.data.format.to_string()} />
+                        <MetaRow label="mcversion" value={props.data.info.mc_version.clone()} />
+                        <MetaRow label="protocol" value={props.data.info.protocol_version.to_string()} />
+                        <MetaRow label="duration (ms)" value={props.data.info.duration_ms.to_string()} />
+                        <MetaRow label="dataVersion" value={
+                            props.data.info.data_version.map_or_else(|| "—".to_string(), |v| v.to_string())
+                        } />
+                        <MetaRow label="players" value={props.data.info.players.len().to_string()} />
+                        <MetaRow label="events" value={total.to_string()} />
                     </div>
                 </div>
             </div>
@@ -237,7 +289,7 @@ fn LoadedView(props: &LoadedViewProps) -> Html {
             <div class="card bg-base-100 shadow">
                 <div class="card-body">
                     <div class="flex items-center justify-between flex-wrap gap-2">
-                        <h2 class="card-title">{ "Packets" }</h2>
+                        <h2 class="card-title">{ "Events" }</h2>
                         <div class="join">
                             <button class="btn btn-sm join-item" onclick={prev}
                                 disabled={cur_page == 0}>{ "Prev" }</button>
@@ -253,8 +305,8 @@ fn LoadedView(props: &LoadedViewProps) -> Html {
                             <thead>
                                 <tr>
                                     <th>{ "#" }</th>
-                                    <th>{ "time" }</th>
-                                    <th>{ "id" }</th>
+                                    <th>{ "time (ms)" }</th>
+                                    <th>{ "event" }</th>
                                     <th>{ "state" }</th>
                                     <th>{ "size" }</th>
                                 </tr>

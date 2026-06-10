@@ -148,7 +148,11 @@ fn event_source_reads_real_sample() {
         }
     }
     // サンプルは 2x2 チャンク (level_chunk_caches/0 に 4 エントリ)
-    assert!(chunk_packets >= 4, "expected ≥4 chunk packets, got {}", chunk_packets);
+    assert!(
+        chunk_packets >= 4,
+        "expected ≥4 chunk packets, got {}",
+        chunk_packets
+    );
     assert!(packets > 0);
     assert!(customs > 0, "sample contains move_entities actions");
 }

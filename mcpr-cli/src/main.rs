@@ -12,9 +12,10 @@ use mcpr_lib::{
         directory::DirArchive,
         zip::{ZipArchiveReader, ZipArchiveWriter},
     },
-    event::{Event, EventSink, EventSource, ReplayInfo, State, Time},
+    event::{Event, EventSink, EventSource, ReplayFormat, ReplayInfo, State, Time, detect_format},
     flashback::{FlashbackEventSink, FlashbackReader},
     mcpr::{McprEventSink, ReplayReader},
+    protocol::LOGIN_PLAY_PACKET_ID,
 };
 
 macro_rules! chmax {
@@ -86,33 +87,16 @@ impl Args {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-enum ReplayType {
-    Flashback,
-    ReplayMod,
-}
-
-/// 入力パスからフォーマットを判別してアーカイブを開く。
-fn detect_and_open(path: &Path) -> anyhow::Result<(ReplayType, Box<dyn ArchiveReader>)> {
-    if path.is_dir() {
-        let reader = DirArchive::new(path);
-        let replay_type = if reader.exists("metaData.json") {
-            ReplayType::ReplayMod
-        } else if reader.exists("metadata.json") {
-            ReplayType::Flashback
-        } else {
-            anyhow::bail!("metadata file not found in {:?}", path);
-        };
-        Ok((replay_type, Box::new(reader)))
+/// 入力パスをアーカイブとして開き、中身からフォーマットを判別する。
+fn detect_and_open(path: &Path) -> anyhow::Result<(ReplayFormat, Box<dyn ArchiveReader>)> {
+    let mut archive: Box<dyn ArchiveReader> = if path.is_dir() {
+        Box::new(DirArchive::new(path))
     } else {
-        let replay_type = match path.extension() {
-            Some(ext) if ext == "mcpr" => ReplayType::ReplayMod,
-            Some(ext) if ext == "zip" => ReplayType::Flashback,
-            _ => anyhow::bail!("unsupported file extension: {:?}", path),
-        };
         let reader = BufReader::new(File::open(path)?);
-        Ok((replay_type, Box::new(ZipArchiveReader::new(reader)?)))
-    }
+        Box::new(ZipArchiveReader::new(reader)?)
+    };
+    let format = detect_format(&mut archive).map_err(|e| anyhow::anyhow!("{}: {:?}", e, path))?;
+    Ok((format, archive))
 }
 
 fn open_archive_writer(
@@ -144,22 +128,17 @@ impl AnySink {
     fn create(output: &Path, args: &Args, info: &ReplayInfo) -> anyhow::Result<Self> {
         let archive = open_archive_writer(output, args.compression_level)?;
         Ok(match args.output_format {
-            OutputFormat::Mcpr => {
-                AnySink::Mcpr(McprEventSink::new(archive, info.protocol_version))
+            OutputFormat::Mcpr => AnySink::Mcpr(McprEventSink::new(archive, info.protocol_version)),
+            OutputFormat::Flashback => {
+                AnySink::Flashback(FlashbackEventSink::new(archive, uuid::Uuid::new_v4())?)
             }
-            OutputFormat::Flashback => AnySink::Flashback(FlashbackEventSink::new(archive)?),
         })
     }
-    fn push(&mut self, event: Event) -> anyhow::Result<()> {
+    /// [`EventSink`] としての本体 (report のみ具象型が要る)。
+    fn as_sink(&mut self) -> &mut dyn EventSink {
         match self {
-            AnySink::Mcpr(sink) => sink.push(event),
-            AnySink::Flashback(sink) => sink.push(event),
-        }
-    }
-    fn finish(&mut self, info: &ReplayInfo) -> anyhow::Result<()> {
-        match self {
-            AnySink::Mcpr(sink) => sink.finish(info),
-            AnySink::Flashback(sink) => sink.finish(info),
+            AnySink::Mcpr(sink) => sink,
+            AnySink::Flashback(sink) => sink,
         }
     }
     fn report(&self) {
@@ -216,7 +195,11 @@ impl Stats {
                 }
             }
             Event::Custom { name, data, .. } => {
-                let entry = self.customs.entry(name.clone()).or_default();
+                // ホットパスでの name clone を避ける (キーは数種類しかない)
+                let entry = match self.customs.get_mut(name.as_str()) {
+                    Some(entry) => entry,
+                    None => self.customs.entry(name.clone()).or_default(),
+                };
                 entry.0 += 1;
                 entry.1 += data.len();
             }
@@ -315,7 +298,7 @@ fn process<S: EventSource>(
                 if *state != State::Play {
                     continue;
                 }
-                if *id == 0x2b {
+                if *id == LOGIN_PLAY_PACKET_ID {
                     // Login (play) packet の重複でクライアントが再 join しないように
                     continue;
                 }
@@ -326,7 +309,7 @@ fn process<S: EventSource>(
             stats.record(&event);
         }
         if let Some(sink) = sink {
-            sink.push(event)?;
+            sink.as_sink().push(event)?;
         }
     }
     Ok(info)
@@ -337,7 +320,10 @@ fn main() -> anyhow::Result<()> {
 
     eprintln!("{:#?}", args);
 
-    anyhow::ensure!(!args.input.is_empty(), "At least one input file is required");
+    anyhow::ensure!(
+        !args.input.is_empty(),
+        "At least one input file is required"
+    );
 
     let mut play_filter = [args.include_packets.is_empty(); 256];
     for packet in args.include_packets() {
@@ -355,39 +341,29 @@ fn main() -> anyhow::Result<()> {
 
     for (index, input) in args.input.iter().enumerate() {
         eprintln!();
-        let (replay_type, archive) = detect_and_open(input)?;
-        eprintln!("[{}] {:?} ({:?})", index, input, replay_type);
+        let (format, archive) = detect_and_open(input)?;
+        eprintln!("[{}] {:?} ({})", index, input, format.name());
 
-        // EventSource の具象型がフォーマットごとに異なるためここで分岐し、
-        // 以降の処理は process() に一本化する
-        let info = match replay_type {
-            ReplayType::Flashback => {
-                let mut source =
-                    FlashbackReader::new(archive).event_source(!args.skip_snapshot)?;
-                process(
-                    &mut source,
-                    &args,
-                    index == 0,
-                    offset_ms,
-                    &play_filter,
-                    &mut stats,
-                    &mut sink,
-                )?
+        // McprEventSource は reader を借用するため、match の外で生かす
+        let mut mcpr_reader;
+        let mut source: Box<dyn EventSource + '_> = match format {
+            ReplayFormat::Flashback => {
+                Box::new(FlashbackReader::new(archive).event_source(!args.skip_snapshot)?)
             }
-            ReplayType::ReplayMod => {
-                let mut reader = ReplayReader::new(archive);
-                let mut source = reader.event_source()?;
-                process(
-                    &mut source,
-                    &args,
-                    index == 0,
-                    offset_ms,
-                    &play_filter,
-                    &mut stats,
-                    &mut sink,
-                )?
+            ReplayFormat::ReplayMod => {
+                mcpr_reader = ReplayReader::new(archive);
+                Box::new(mcpr_reader.event_source()?)
             }
         };
+        let info = process(
+            &mut source,
+            &args,
+            index == 0,
+            offset_ms,
+            &play_filter,
+            &mut stats,
+            &mut sink,
+        )?;
 
         players.extend(info.players.iter().cloned());
         offset_ms += info.duration_ms + args.interval as u64;
@@ -401,7 +377,7 @@ fn main() -> anyhow::Result<()> {
             players,
             ..base
         };
-        sink.finish(&info)?;
+        sink.as_sink().finish(&info)?;
         sink.report();
     }
 

@@ -121,6 +121,16 @@ impl<W: io::Write + ?Sized> Serializer for W {}
 pub const LOGIN_SUCCESS_PACKET_ID: i32 = 0x02;
 /// Configuration phase の遷移パケット id (protocol 764 / 1.20.2 以降で安定)。
 pub const FINISH_CONFIGURATION_PACKET_ID: i32 = 0x03;
+/// Play phase の Login (play) パケット id。
+/// 注意: 遷移 id と異なりバージョン間で安定しない (protocol 774 / 1.21.11 で確認した値)。
+pub const LOGIN_PLAY_PACKET_ID: i32 = 0x2b;
+
+/// `value` を VarInt エンコードしたときのバイト数 (1..=5)。
+/// [`Serializer::write_varint`] の出力長と一致する (負数は常に 5)。
+pub fn varint_len(value: i32) -> usize {
+    let bits = 32 - (value as u32 | 1).leading_zeros();
+    bits.div_ceil(7) as usize
+}
 
 /// Login Success (login phase 0x02) の body を合成する。
 ///

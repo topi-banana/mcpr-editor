@@ -11,6 +11,11 @@
 
 use std::collections::HashSet;
 
+use crate::{
+    archive::ArchiveReader,
+    protocol::{FINISH_CONFIGURATION_PACKET_ID, LOGIN_SUCCESS_PACKET_ID},
+};
+
 /// リプレイ内の時刻。ミリ秒で正規化して保持する。
 ///
 /// Flashback は tick (1 tick = 50ms) で時間を表現するため、
@@ -58,13 +63,13 @@ pub enum State {
 impl State {
     /// clientbound パケット `packet_id` を観測した後の次の state。
     ///
-    /// 遷移 id (Login Success = 0x02, Finish Configuration = 0x03) は
-    /// protocol 764 (1.20.2) 以降で安定している値。それ以前の
-    /// プロトコルを扱う場合はここを protocol_version 依存にする。
+    /// 遷移 id は protocol 764 (1.20.2) 以降で安定している値
+    /// ([`crate::protocol`] の定数)。それ以前のプロトコルを扱う場合は
+    /// ここを protocol_version 依存にする。
     pub fn advance(self, packet_id: i32) -> State {
         match (self, packet_id) {
-            (State::Login, 0x02) => State::Configuration,
-            (State::Configuration, 0x03) => State::Play,
+            (State::Login, LOGIN_SUCCESS_PACKET_ID) => State::Configuration,
+            (State::Configuration, FINISH_CONFIGURATION_PACKET_ID) => State::Play,
             _ => self,
         }
     }
@@ -143,12 +148,59 @@ impl From<&crate::flashback::MetaData> for ReplayInfo {
     }
 }
 
+/// リプレイアーカイブの物理フォーマット。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplayFormat {
+    ReplayMod,
+    Flashback,
+}
+
+impl ReplayFormat {
+    pub fn name(&self) -> &'static str {
+        match self {
+            ReplayFormat::ReplayMod => "ReplayMod",
+            ReplayFormat::Flashback => "Flashback",
+        }
+    }
+}
+
+/// アーカイブ内のメタデータファイル名でフォーマットを判別する。
+/// 拡張子に依存しないため、.zip に固められた .mcpr 相当も正しく扱える。
+pub fn detect_format<R: ArchiveReader + ?Sized>(archive: &mut R) -> anyhow::Result<ReplayFormat> {
+    if archive.get_reader(crate::mcpr::METADATA_FILE).is_ok() {
+        Ok(ReplayFormat::ReplayMod)
+    } else if archive.get_reader(crate::flashback::METADATA_FILE).is_ok() {
+        Ok(ReplayFormat::Flashback)
+    } else {
+        anyhow::bail!("metadata file not found: not a ReplayMod / Flashback archive")
+    }
+}
+
 /// リプレイをイベント列として読み出す抽象。
 pub trait EventSource {
     /// リプレイ全体のメタ情報。
     fn info(&self) -> &ReplayInfo;
     /// 次のイベント。終端で `Ok(None)`。
     fn next_event(&mut self) -> anyhow::Result<Option<Event>>;
+    /// イベント列を Iterator として消費する。
+    fn events(&mut self) -> Events<'_, Self>
+    where
+        Self: Sized,
+    {
+        Events { source: self }
+    }
+}
+
+/// [`EventSource::events`] が返す Iterator ブリッジ。
+pub struct Events<'a, S> {
+    source: &'a mut S,
+}
+
+impl<S: EventSource> Iterator for Events<'_, S> {
+    type Item = anyhow::Result<Event>;
+    fn next(&mut self) -> Option<Self::Item> {
+        self.source.next_event().transpose()
+    }
 }
 
 /// リプレイをイベント列として書き込む抽象。
@@ -159,39 +211,12 @@ pub trait EventSink {
     fn finish(&mut self, info: &ReplayInfo) -> anyhow::Result<()>;
 }
 
-impl<T: ?Sized + EventSource> EventSource for &mut T {
-    fn info(&self) -> &ReplayInfo {
-        (**self).info()
-    }
-    fn next_event(&mut self) -> anyhow::Result<Option<Event>> {
-        (**self).next_event()
-    }
-}
-
 impl<T: ?Sized + EventSource> EventSource for Box<T> {
     fn info(&self) -> &ReplayInfo {
         (**self).info()
     }
     fn next_event(&mut self) -> anyhow::Result<Option<Event>> {
         (**self).next_event()
-    }
-}
-
-impl<T: ?Sized + EventSink> EventSink for &mut T {
-    fn push(&mut self, event: Event) -> anyhow::Result<()> {
-        (**self).push(event)
-    }
-    fn finish(&mut self, info: &ReplayInfo) -> anyhow::Result<()> {
-        (**self).finish(info)
-    }
-}
-
-impl<T: ?Sized + EventSink> EventSink for Box<T> {
-    fn push(&mut self, event: Event) -> anyhow::Result<()> {
-        (**self).push(event)
-    }
-    fn finish(&mut self, info: &ReplayInfo) -> anyhow::Result<()> {
-        (**self).finish(info)
     }
 }
 

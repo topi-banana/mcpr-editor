@@ -7,15 +7,17 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     archive::{ArchiveReader, ArchiveWriter},
-    event::{Event, EventSink, EventSource, ReplayInfo, Time},
+    event::{Event, EventSink, EventSource, ReplayInfo, State, Time},
     protocol::{
         Deserializer, FINISH_CONFIGURATION_PACKET_ID, LOGIN_SUCCESS_PACKET_ID, Serializer,
-        login_success_payload,
+        login_success_payload, varint_len,
     },
 };
 
-// 後方互換: State は共通語彙として crate::event に移動した。
-pub use crate::event::State;
+/// アーカイブ内のメタデータファイル名 (フォーマット判別の根拠でもある)。
+pub const METADATA_FILE: &str = "metaData.json";
+/// アーカイブ内の録画ストリームのファイル名。
+pub const RECORDING_FILE: &str = "recording.tmcpr";
 
 #[derive(Debug, Clone, PartialEq, PartialOrd)]
 pub struct Packet {
@@ -43,10 +45,8 @@ impl Packet {
     pub fn into_parts(self) -> (u32, i32, Box<[u8]>) {
         (self.time, self.id, self.data)
     }
-    pub fn length(&self) -> io::Result<u32> {
-        let mut p = Vec::new();
-        Cursor::new(&mut p).write_varint(self.id)?;
-        Ok(p.len() as u32 + self.data.len() as u32)
+    pub fn length(&self) -> u32 {
+        (varint_len(self.id) + self.data.len()) as u32
     }
     /// from .tmcpr
     pub fn read_from<R: Read>(reader: &mut R) -> io::Result<Option<Self>> {
@@ -74,7 +74,7 @@ impl Packet {
     /// to .tmcpr
     pub fn write_to<W: Write>(&self, writer: &mut W) -> io::Result<()> {
         writer.write_all(&self.time.to_be_bytes())?;
-        writer.write_all(&self.length()?.to_be_bytes())?;
+        writer.write_all(&self.length().to_be_bytes())?;
         writer.write_varint(self.id)?;
         writer.write_all(&self.data)?;
         Ok(())
@@ -202,20 +202,20 @@ impl<R: ArchiveReader> ReplayReader<R> {
         Self { reader }
     }
     pub fn read_metadata(&mut self) -> anyhow::Result<MetaData> {
-        let reader = BufReader::new(self.reader.get_reader("metaData.json")?);
+        let reader = BufReader::new(self.reader.get_reader(METADATA_FILE)?);
         let metadata = serde_json::from_reader(reader)?;
         Ok(metadata)
     }
     pub fn get_packet_reader<'a>(
         &'a mut self,
     ) -> anyhow::Result<ReadablePacketStream<impl Read + 'a>> {
-        let reader = BufReader::new(self.reader.get_reader("recording.tmcpr")?);
+        let reader = BufReader::new(self.reader.get_reader(RECORDING_FILE)?);
         Ok(ReadablePacketStream::new(State::Login, reader))
     }
     /// メタデータを読んだうえで論理イベント列リーダーを開く。
     pub fn event_source<'a>(&'a mut self) -> anyhow::Result<McprEventSource<impl Read + 'a>> {
         let info = ReplayInfo::from(&self.read_metadata()?);
-        let reader = BufReader::new(self.reader.get_reader("recording.tmcpr")?);
+        let reader = BufReader::new(self.reader.get_reader(RECORDING_FILE)?);
         Ok(McprEventSource::new(reader, info))
     }
 }
@@ -230,14 +230,14 @@ impl<W: ArchiveWriter> ReplayWriter<W> {
     }
 
     pub fn write_metadata(&mut self, metadata: MetaData) -> anyhow::Result<()> {
-        let writer = BufWriter::new(self.writer.get_writer("metaData.json")?);
+        let writer = BufWriter::new(self.writer.get_writer(METADATA_FILE)?);
         serde_json::to_writer(writer, &metadata)?;
         Ok(())
     }
     pub fn get_packet_writer<'a>(
         &'a mut self,
     ) -> anyhow::Result<WritablePacketStream<impl Write + 'a>> {
-        let writer = BufWriter::new(self.writer.get_writer("recording.tmcpr")?);
+        let writer = BufWriter::new(self.writer.get_writer(RECORDING_FILE)?);
         Ok(WritablePacketStream::new(writer))
     }
 }
@@ -345,7 +345,7 @@ impl<W: ArchiveWriter> EventSink for McprEventSink<W> {
         }
         self.finished = true;
         {
-            let mut writer = self.archive.get_writer("recording.tmcpr")?;
+            let mut writer = self.archive.get_writer(RECORDING_FILE)?;
             writer.write_all(&self.buffer)?;
             writer.flush()?;
         }
@@ -359,7 +359,7 @@ impl<W: ArchiveWriter> EventSink for McprEventSink<W> {
             players: info.players.clone(),
             ..Default::default()
         };
-        let writer = BufWriter::new(self.archive.get_writer("metaData.json")?);
+        let writer = BufWriter::new(self.archive.get_writer(METADATA_FILE)?);
         serde_json::to_writer(writer, &metadata)?;
         Ok(())
     }
@@ -387,7 +387,10 @@ mod tests {
         packet.write_to(&mut buf).unwrap();
         let read = Packet::read_from(&mut Cursor::new(&buf)).unwrap().unwrap();
         assert_eq!(packet, read);
-        assert_eq!(Packet::read_from(&mut Cursor::new(&buf[..3])).unwrap(), None);
+        assert_eq!(
+            Packet::read_from(&mut Cursor::new(&buf[..3])).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -404,10 +407,7 @@ mod tests {
         let info = ReplayInfo::default();
         let mut source = McprEventSource::new(Cursor::new(buf), info);
 
-        let mut events = Vec::new();
-        while let Some(event) = source.next_event().unwrap() {
-            events.push(event);
-        }
+        let events: Vec<Event> = source.events().collect::<anyhow::Result<_>>().unwrap();
         let states: Vec<State> = events
             .iter()
             .map(|e| match e {
@@ -444,17 +444,7 @@ mod tests {
         assert!(source.next_event().is_err());
     }
 
-    /// テスト用のメモリ上アーカイブ。
-    #[derive(Default)]
-    struct MemArchive(std::collections::HashMap<String, Vec<u8>>);
-    impl ArchiveWriter for MemArchive {
-        fn get_writer<'this>(
-            &'this mut self,
-            filename: &str,
-        ) -> anyhow::Result<Box<dyn Write + 'this>> {
-            Ok(Box::new(self.0.entry(filename.to_string()).or_default()))
-        }
-    }
+    use crate::archive::testing::MemArchive;
 
     fn packet_event(time_ms: u64, state: State, id: i32, data: &[u8]) -> Event {
         Event::Packet {
@@ -563,8 +553,7 @@ mod tests {
         };
         sink.finish(&info).unwrap();
         let archive = sink.into_archive();
-        let metadata: MetaData =
-            serde_json::from_slice(&archive.0["metaData.json"]).unwrap();
+        let metadata: MetaData = serde_json::from_slice(&archive.0["metaData.json"]).unwrap();
         assert_eq!(metadata.protocol, 774);
         assert_eq!(metadata.mcversion, "1.21.11");
         assert_eq!(metadata.fileFormat, "MCPR");
