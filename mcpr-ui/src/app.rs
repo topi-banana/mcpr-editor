@@ -1,4 +1,4 @@
-use std::{io::Cursor, rc::Rc};
+use std::{cmp::Ordering, io::Cursor, rc::Rc};
 
 use gloo_file::{
     File as GlooFile,
@@ -128,6 +128,47 @@ impl EventFilter {
             RowKind::Packet { id, .. } => self.query_id == Some(*id),
             RowKind::Custom { name } => name.contains(&self.query_lower),
         }
+    }
+}
+
+/// ソート対象のカラム。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SortKey {
+    Index,
+    Time,
+    Event,
+    State,
+    Size,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SortDir {
+    Asc,
+    Desc,
+}
+
+/// event 列の全順序: packet (id 順) → custom (名前順)。
+fn event_ord(a: &RowKind, b: &RowKind) -> Ordering {
+    match (a, b) {
+        (RowKind::Packet { id: a, .. }, RowKind::Packet { id: b, .. }) => a.cmp(b),
+        (RowKind::Custom { name: a }, RowKind::Custom { name: b }) => a.cmp(b),
+        (RowKind::Packet { .. }, RowKind::Custom { .. }) => Ordering::Less,
+        (RowKind::Custom { .. }, RowKind::Packet { .. }) => Ordering::Greater,
+    }
+}
+
+/// `indices` (元 index 昇順) をカラム値で並べ替える。
+/// 安定ソートのため同値は記録順を保つ (Desc は全体の反転)。
+fn sort_indices(events: &[EventRow], indices: &mut [usize], key: SortKey, dir: SortDir) {
+    match key {
+        SortKey::Index => {}
+        SortKey::Time => indices.sort_by_key(|&i| events[i].time_ms),
+        SortKey::Event => indices.sort_by(|&a, &b| event_ord(&events[a].kind, &events[b].kind)),
+        SortKey::State => indices.sort_by_key(|&i| Category::of(&events[i].kind).bit()),
+        SortKey::Size => indices.sort_by_key(|&i| events[i].size),
+    }
+    if dir == SortDir::Desc {
+        indices.reverse();
     }
 }
 
@@ -339,25 +380,35 @@ impl<T> PartialEq for RcPtr<T> {
 fn LoadedView(props: &LoadedViewProps) -> Html {
     let page = use_state(|| 0usize);
     let filter = use_state(EventFilter::default);
+    let sort = use_state(|| Option::<(SortKey, SortDir)>::None);
 
-    // フィルタを通過した行の元 index 列 (None = フィルタなし)。
-    // filter か events が変わった時だけ全行を走査する。
+    // 表示する行の元 index 列 (None = 全行を記録順のまま)。
+    // filter / sort / events が変わった時だけ全行を走査する。
     let indices = use_memo(
-        (RcPtr(props.data.events.clone()), (*filter).clone()),
-        |(events, filter)| {
-            (!filter.is_empty()).then(|| {
-                let mut matched = Vec::with_capacity(events.0.len());
-                matched.extend(
+        (RcPtr(props.data.events.clone()), (*filter).clone(), *sort),
+        |(events, filter, sort)| {
+            if filter.is_empty() && sort.is_none() {
+                return None;
+            }
+            let events = &events.0;
+            let mut matched: Vec<usize> = if filter.is_empty() {
+                (0..events.len()).collect()
+            } else {
+                let mut v = Vec::with_capacity(events.len());
+                v.extend(
                     events
-                        .0
                         .iter()
                         .enumerate()
                         .filter(|(_, row)| filter.matches(row))
                         .map(|(i, _)| i),
                 );
-                matched.shrink_to_fit();
-                matched
-            })
+                v.shrink_to_fit();
+                v
+            };
+            if let Some((key, dir)) = *sort {
+                sort_indices(events, &mut matched, key, dir);
+            }
+            Some(matched)
         },
     );
     let indices: &Option<Vec<usize>> = &indices;
@@ -378,6 +429,41 @@ fn LoadedView(props: &LoadedViewProps) -> Html {
             page.set(0);
             filter.set(next);
         })
+    };
+
+    // ヘッダクリックで 昇順 → 降順 → 解除 を巡回する。
+    let on_sort = {
+        let sort = sort.clone();
+        let page = page.clone();
+        Callback::from(move |key: SortKey| {
+            let next = match *sort {
+                Some((k, SortDir::Asc)) if k == key => Some((key, SortDir::Desc)),
+                Some((k, SortDir::Desc)) if k == key => None,
+                _ => Some((key, SortDir::Asc)),
+            };
+            page.set(0);
+            sort.set(next);
+        })
+    };
+
+    // width: table-fixed レイアウトでの列幅 (None = 残り幅を使う)。
+    // ソートで表示内容が入れ替わっても列幅が動かないようにする。
+    let sortable_th = |label: &'static str, key: SortKey, width: Option<&'static str>| -> Html {
+        let onclick = {
+            let on_sort = on_sort.clone();
+            Callback::from(move |_| on_sort.emit(key))
+        };
+        let indicator = match *sort {
+            Some((k, SortDir::Asc)) if k == key => "▲",
+            Some((k, SortDir::Desc)) if k == key => "▼",
+            _ => "",
+        };
+        html! {
+            <th class={classes!("cursor-pointer", "select-none", width)} {onclick}>
+                { label }
+                <span class="text-primary inline-block w-3 ml-0.5">{ indicator }</span>
+            </th>
+        }
     };
 
     let prev = {
@@ -438,7 +524,8 @@ fn LoadedView(props: &LoadedViewProps) -> Html {
                     html! { <span class="badge badge-ghost badge-sm">{ state_name(*state) }</span> },
                 ),
                 RowKind::Custom { name } => (
-                    html! { <code>{ name.clone() }</code> },
+                    // truncate されても hover (title) で全名を確認できる
+                    html! { <code title={name.clone()}>{ name.clone() }</code> },
                     html! { <span class="text-base-content/40">{ "—" }</span> },
                 ),
             };
@@ -446,7 +533,7 @@ fn LoadedView(props: &LoadedViewProps) -> Html {
                 <tr>
                     <td>{ orig }</td>
                     <td>{ row.time_ms }</td>
-                    <td>{ event }</td>
+                    <td class="truncate">{ event }</td>
                     <td>{ state }</td>
                     <td>{ row.size }</td>
                 </tr>
@@ -506,14 +593,14 @@ fn LoadedView(props: &LoadedViewProps) -> Html {
                             oninput={on_query} />
                     </div>
                     <div class="overflow-x-auto">
-                        <table class="table table-zebra table-sm">
+                        <table class="table table-zebra table-sm table-fixed min-w-[42rem]">
                             <thead>
                                 <tr>
-                                    <th>{ "#" }</th>
-                                    <th>{ "time (ms)" }</th>
-                                    <th>{ "event" }</th>
-                                    <th>{ "state" }</th>
-                                    <th>{ "size" }</th>
+                                    { sortable_th("#", SortKey::Index, Some("w-24")) }
+                                    { sortable_th("time (ms)", SortKey::Time, Some("w-28")) }
+                                    { sortable_th("event", SortKey::Event, None) }
+                                    { sortable_th("state", SortKey::State, Some("w-28")) }
+                                    { sortable_th("size", SortKey::Size, Some("w-24")) }
                                 </tr>
                             </thead>
                             <tbody>{ rows }</tbody>
@@ -610,5 +697,63 @@ mod tests {
         // クエリは一致するがカテゴリが非表示
         assert!(!f.matches(&packet(0x07, State::Play)));
         assert!(f.matches(&packet(0x07, State::Configuration)));
+    }
+
+    fn sorted(events: &[EventRow], key: SortKey, dir: SortDir) -> Vec<usize> {
+        let mut indices: Vec<usize> = (0..events.len()).collect();
+        sort_indices(events, &mut indices, key, dir);
+        indices
+    }
+
+    #[test]
+    fn sort_by_time_is_stable() {
+        let mut events = vec![
+            packet(0x01, State::Play),
+            packet(0x02, State::Play),
+            packet(0x03, State::Play),
+        ];
+        events[0].time_ms = 100;
+        // index 1, 2 は同時刻 → 記録順を保つ
+        events[1].time_ms = 50;
+        events[2].time_ms = 50;
+        assert_eq!(sorted(&events, SortKey::Time, SortDir::Asc), vec![1, 2, 0]);
+        assert_eq!(sorted(&events, SortKey::Time, SortDir::Desc), vec![0, 2, 1]);
+    }
+
+    #[test]
+    fn sort_by_event_orders_packets_before_customs() {
+        let events = vec![
+            custom("flashback:action/move_entities"),
+            packet(0x2c, State::Play),
+            custom("flashback:action/accurate_player_position"),
+            packet(0x07, State::Configuration),
+        ];
+        // packet (id 順) → custom (名前順)
+        assert_eq!(
+            sorted(&events, SortKey::Event, SortDir::Asc),
+            vec![3, 1, 2, 0]
+        );
+    }
+
+    #[test]
+    fn sort_by_state_follows_phase_order() {
+        let events = vec![
+            custom("flashback:action/move_entities"),
+            packet(0x2c, State::Play),
+            packet(0x02, State::Login),
+            packet(0x07, State::Configuration),
+        ];
+        // Login → Config → Play → Custom
+        assert_eq!(
+            sorted(&events, SortKey::State, SortDir::Asc),
+            vec![2, 3, 1, 0]
+        );
+    }
+
+    #[test]
+    fn sort_by_index_desc_reverses() {
+        let events = vec![packet(0x01, State::Play), packet(0x02, State::Play)];
+        assert_eq!(sorted(&events, SortKey::Index, SortDir::Asc), vec![0, 1]);
+        assert_eq!(sorted(&events, SortKey::Index, SortDir::Desc), vec![1, 0]);
     }
 }
