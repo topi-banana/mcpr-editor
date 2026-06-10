@@ -120,3 +120,35 @@ fn dir_to_zip_roundtrip() {
 // 未使用クレート警告回避
 #[allow(dead_code)]
 fn _assert_archive_traits<A: ArchiveReader + ArchiveWriter>() {}
+
+#[test]
+fn event_source_reads_real_sample() {
+    use mcpr_lib::event::{Event, EventSource};
+
+    let Some(src) = sample_dir() else {
+        eprintln!("skip: tmp/flashback sample not present");
+        return;
+    };
+    let reader = FlashbackReader::new(DirArchive::new(&src));
+    let mut source = reader.event_source(true).unwrap();
+    assert_eq!(source.info().protocol_version, 774);
+
+    let mut packets = 0usize;
+    let mut customs = 0usize;
+    let mut chunk_packets = 0usize;
+    let mut last_time = mcpr_lib::event::Time::ZERO;
+    while let Some(event) = source.next_event().unwrap() {
+        assert!(event.time() >= last_time, "time must be monotonic");
+        last_time = event.time();
+        match event {
+            // 0x2c = 1.21.11 の ClientboundLevelChunkWithLightPacket
+            Event::Packet { id: 0x2c, .. } => chunk_packets += 1,
+            Event::Packet { .. } => packets += 1,
+            Event::Custom { .. } => customs += 1,
+        }
+    }
+    // サンプルは 2x2 チャンク (level_chunk_caches/0 に 4 エントリ)
+    assert!(chunk_packets >= 4, "expected ≥4 chunk packets, got {}", chunk_packets);
+    assert!(packets > 0);
+    assert!(customs > 0, "sample contains move_entities actions");
+}
