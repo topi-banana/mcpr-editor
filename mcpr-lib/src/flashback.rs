@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     archive::{ArchiveReader, ArchiveWriter},
-    event::{Event, EventSource, ReplayInfo, State, Time},
+    event::{Event, EventSink, EventSource, ReplayInfo, State, Time},
     protocol::{Deserializer, Serializer},
 };
 
@@ -31,6 +31,18 @@ pub enum ActionKind {
 }
 
 impl ActionKind {
+    /// 既知 action の一覧 (Flashback mod の ActionRegistry 登録順)。
+    /// chunk ヘッダの action テーブルはこの全種を常に登録する。
+    pub const KNOWN: [ActionKind; 7] = [
+        ActionKind::NextTick,
+        ActionKind::GamePacket,
+        ActionKind::ConfigurationPacket,
+        ActionKind::CreateLocalPlayer,
+        ActionKind::MoveEntities,
+        ActionKind::LevelChunkCached,
+        ActionKind::AccuratePlayerPosition,
+    ];
+
     pub fn as_str(&self) -> &str {
         match self {
             ActionKind::NextTick => "flashback:action/next_tick",
@@ -514,6 +526,156 @@ impl<W: ArchiveWriter> FlashbackWriter<W> {
     }
 }
 
+/// 論理イベント列を Flashback リプレイとして書き出す Sink。
+///
+/// 時刻の進行は tick 差分から `NextTick` action を合成して表現する
+/// (ms → tick は切り捨て)。イベントのマッピング:
+/// - `Packet` (Play) → `GamePacket`、(Configuration) →
+///   `ConfigurationPacket`。チャンクパケットも dedup せず
+///   `GamePacket` としてインラインに書く
+/// - `Packet` (Login / Handshaking / Status) → 対応する action が
+///   無いためスキップ ([`Self::skipped_packets`])
+/// - `Custom` → 既知の flashback action 名ならそのまま書き戻す
+///   (flashback → flashback で move_entities 等がロスレスに残る)。
+///   未知名は action テーブルがヘッダ先書きのため登録できず
+///   スキップ ([`Self::skipped_customs`])
+///
+/// 出力は空 snapshot の `c0.flashback` 1 本 + `metadata.json`。
+/// mcpr 由来では data_version が判明しないため 0 を書く
+/// (Flashback mod 側での再生可否は data_version に依存しうる)。
+pub struct FlashbackEventSink<W: ArchiveWriter> {
+    archive: W,
+    chunk: Option<ChunkWriter<Vec<u8>>>,
+    tick: u64,
+    uuid: uuid::Uuid,
+    skipped_packets: usize,
+    skipped_customs: usize,
+    finished: bool,
+}
+
+impl<W: ArchiveWriter> FlashbackEventSink<W> {
+    pub fn new(archive: W) -> anyhow::Result<Self> {
+        Self::with_uuid(archive, uuid::Uuid::new_v4())
+    }
+    /// metadata.json に書くリプレイ uuid を指定する。
+    pub fn with_uuid(archive: W, uuid: uuid::Uuid) -> anyhow::Result<Self> {
+        let chunk = ChunkWriter::new(Vec::new(), &ActionKind::KNOWN, &[])?;
+        Ok(Self {
+            archive,
+            chunk: Some(chunk),
+            tick: 0,
+            uuid,
+            skipped_packets: 0,
+            skipped_customs: 0,
+            finished: false,
+        })
+    }
+    /// 対応 action が無くスキップした非 Play/Configuration パケット数。
+    pub fn skipped_packets(&self) -> usize {
+        self.skipped_packets
+    }
+    /// 未知名のためスキップした Custom イベント数。
+    pub fn skipped_customs(&self) -> usize {
+        self.skipped_customs
+    }
+    pub fn into_archive(self) -> W {
+        self.archive
+    }
+
+    /// `target` tick まで `NextTick` を合成する。過去の時刻は現 tick に丸める。
+    fn advance_tick(&mut self, target: u64) -> anyhow::Result<()> {
+        let chunk = self.chunk.as_mut().expect("not finished");
+        while self.tick < target {
+            chunk.push(&Action::new(ActionKind::NextTick, Box::new([])))?;
+            self.tick += 1;
+        }
+        Ok(())
+    }
+}
+
+impl<W: ArchiveWriter> EventSink for FlashbackEventSink<W> {
+    fn push(&mut self, event: Event) -> anyhow::Result<()> {
+        match event {
+            Event::Packet {
+                time,
+                state,
+                id,
+                data,
+            } => {
+                let kind = match state {
+                    State::Play => ActionKind::GamePacket,
+                    State::Configuration => ActionKind::ConfigurationPacket,
+                    _ => {
+                        self.skipped_packets += 1;
+                        return Ok(());
+                    }
+                };
+                self.advance_tick(time.as_ticks())?;
+                let mut payload = Vec::with_capacity(data.len() + 5);
+                payload.write_varint(id)?;
+                payload.extend_from_slice(&data);
+                self.chunk
+                    .as_mut()
+                    .expect("not finished")
+                    .push(&Action::new(kind, payload.into()))?;
+            }
+            Event::Custom { time, name, data } => {
+                let kind = ActionKind::parse(&name);
+                if matches!(kind, ActionKind::Unknown(_)) {
+                    self.skipped_customs += 1;
+                    return Ok(());
+                }
+                self.advance_tick(time.as_ticks())?;
+                self.chunk
+                    .as_mut()
+                    .expect("not finished")
+                    .push(&Action::new(kind, data))?;
+            }
+        }
+        Ok(())
+    }
+    fn finish(&mut self, info: &ReplayInfo) -> anyhow::Result<()> {
+        if self.finished {
+            anyhow::bail!("FlashbackEventSink::finish called twice");
+        }
+        self.finished = true;
+
+        // 末尾まで時間を進める (duration が tick 数の根拠になる)
+        let total_ticks = self
+            .tick
+            .max(Time::from_millis(info.duration_ms).as_ticks());
+        self.advance_tick(total_ticks)?;
+
+        let bytes = self.chunk.take().expect("not finished").finish()?;
+        {
+            let mut writer = self.archive.get_writer("c0.flashback")?;
+            writer.write_all(&bytes)?;
+            writer.flush()?;
+        }
+
+        let metadata = MetaData {
+            uuid: self.uuid,
+            name: "Unnamed".to_string(),
+            version_string: info.mc_version.clone(),
+            world_name: Some("World".to_string()),
+            data_version: info.data_version.unwrap_or(0),
+            protocol_version: info.protocol_version,
+            total_ticks,
+            markers: Some(serde_json::json!({})),
+            chunks: BTreeMap::from([(
+                "c0.flashback".to_string(),
+                ChunkMeta {
+                    duration: total_ticks,
+                    force_play_snapshot: false,
+                },
+            )]),
+        };
+        let writer = BufWriter::new(self.archive.get_writer("metadata.json")?);
+        serde_json::to_writer(writer, &metadata)?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -623,6 +785,7 @@ mod tests {
     }
 
     /// テスト用のメモリ上アーカイブ。
+    #[derive(Default)]
     struct MemArchive(HashMap<String, Vec<u8>>);
     impl ArchiveReader for MemArchive {
         fn get_reader<'this>(
@@ -634,6 +797,14 @@ mod tests {
                 .get(filename)
                 .ok_or_else(|| anyhow::anyhow!("no such file: {}", filename))?;
             Ok(Box::new(Cursor::new(data.clone())))
+        }
+    }
+    impl ArchiveWriter for MemArchive {
+        fn get_writer<'this>(
+            &'this mut self,
+            filename: &str,
+        ) -> anyhow::Result<Box<dyn Write + 'this>> {
+            Ok(Box::new(self.0.entry(filename.to_string()).or_default()))
         }
     }
 
@@ -842,5 +1013,114 @@ mod tests {
             e,
             Event::Packet { id: 0x2c, data, .. } if data.as_ref() == [0xBB, 0xCC]
         )));
+    }
+
+    #[test]
+    fn event_sink_roundtrips_through_event_source() {
+        let events = vec![
+            // Login パケットは flashback に対応物が無くスキップされる
+            Event::Packet {
+                time: Time::from_ticks(0),
+                state: State::Login,
+                id: 0x02,
+                data: vec![0].into(),
+            },
+            Event::Packet {
+                time: Time::from_ticks(0),
+                state: State::Configuration,
+                id: 0x07,
+                data: vec![7].into(),
+            },
+            Event::Packet {
+                time: Time::from_ticks(0),
+                state: State::Play,
+                id: 0x2b,
+                data: vec![1, 2].into(),
+            },
+            Event::Custom {
+                time: Time::from_ticks(2),
+                name: "flashback:action/move_entities".to_string(),
+                data: vec![9, 9].into(),
+            },
+            // 未知の custom はスキップされる
+            Event::Custom {
+                time: Time::from_ticks(2),
+                name: "thirdparty:action/foo".to_string(),
+                data: vec![1].into(),
+            },
+            Event::Packet {
+                time: Time::from_ticks(5),
+                state: State::Play,
+                id: 0x60,
+                data: vec![6].into(),
+            },
+        ];
+
+        let mut sink =
+            FlashbackEventSink::with_uuid(MemArchive::default(), uuid::Uuid::nil()).unwrap();
+        for event in events.clone() {
+            sink.push(event).unwrap();
+        }
+        let info = ReplayInfo {
+            mc_version: "1.21.11".to_string(),
+            protocol_version: 774,
+            duration_ms: 250,
+            data_version: Some(4671),
+            players: Default::default(),
+        };
+        sink.finish(&info).unwrap();
+        assert_eq!(sink.skipped_packets(), 1);
+        assert_eq!(sink.skipped_customs(), 1);
+        let archive = sink.into_archive();
+
+        // metadata の検証
+        let metadata: MetaData = serde_json::from_slice(&archive.0["metadata.json"]).unwrap();
+        assert_eq!(metadata.protocol_version, 774);
+        assert_eq!(metadata.data_version, 4671);
+        assert_eq!(metadata.total_ticks, 5);
+        assert_eq!(metadata.chunks["c0.flashback"].duration, 5);
+
+        // 読み戻し: Login とunknown custom が落ち、残りが tick 時刻で一致
+        let read = collect_events(FlashbackReader::new(archive).event_source(false).unwrap());
+        let expected: Vec<Event> = events
+            .into_iter()
+            .filter(|e| match e {
+                Event::Packet { state, .. } => {
+                    matches!(state, State::Play | State::Configuration)
+                }
+                Event::Custom { name, .. } => name.starts_with("flashback:"),
+            })
+            .collect();
+        assert_eq!(read, expected);
+    }
+
+    #[test]
+    fn event_sink_synthesizes_next_ticks() {
+        let mut sink =
+            FlashbackEventSink::with_uuid(MemArchive::default(), uuid::Uuid::nil()).unwrap();
+        // 130ms → tick 2 (切り捨て)
+        sink.push(Event::Packet {
+            time: Time::from_millis(130),
+            state: State::Play,
+            id: 0x10,
+            data: Box::new([]),
+        })
+        .unwrap();
+        sink.finish(&ReplayInfo::default()).unwrap();
+        let mut archive = sink.into_archive();
+
+        let chunk_bytes = archive.0["c0.flashback"].clone();
+        let reader = ChunkReader::new(Cursor::new(chunk_bytes)).unwrap();
+        let kinds: Vec<ActionKind> = reader.map(|a| a.kind().clone()).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                ActionKind::NextTick,
+                ActionKind::NextTick,
+                ActionKind::GamePacket,
+            ]
+        );
+        // ArchiveReader としても読めることを確認 (Read+Write 両 impl)
+        let _ = archive.get_reader("c0.flashback").unwrap();
     }
 }

@@ -11,6 +11,10 @@ gloo-file = "0.3"
 # getrandom 0.3 (zip 経由) と 0.2 (yew 経由) の wasm backend を有効化。
 getrandom = { version = "0.3", features = ["wasm_js"] }
 getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"] }
+# mcpr-lib の uuid v4 (FlashbackEventSink) が wasm では乱数源の明示を
+# 要求するため、getrandom backend (uuid 1.19 は 0.4 系) を選択する。
+uuid = { version = "1.19", features = ["rng-getrandom"] }
+getrandom_04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
 web-sys = { version = "0.3", features = [
     "DataTransfer",
     "DragEvent",
