@@ -7,8 +7,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     archive::{ArchiveReader, ArchiveWriter},
+    event::{Event, EventSource, ReplayInfo, Time},
     protocol::{Deserializer, Serializer},
 };
+
+// 後方互換: State は共通語彙として crate::event に移動した。
+pub use crate::event::State;
 
 #[derive(Debug, Clone, PartialEq, PartialOrd)]
 pub struct Packet {
@@ -32,6 +36,9 @@ impl Packet {
     }
     pub fn data(&self) -> &[u8] {
         &self.data
+    }
+    pub fn into_parts(self) -> (u32, i32, Box<[u8]>) {
+        (self.time, self.id, self.data)
     }
     pub fn length(&self) -> io::Result<u32> {
         let mut p = Vec::new();
@@ -107,14 +114,6 @@ impl Default for MetaData {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum State {
-    Handshaking,
-    Status,
-    Login,
-    Configuration,
-    Play,
-}
 pub struct ReadablePacketStream<R> {
     state: State,
     reader: R,
@@ -131,12 +130,7 @@ impl<R: Read> Iterator for ReadablePacketStream<R> {
             .unwrap_or_default()
             .map(|packet| {
                 let old_state = self.state;
-                if old_state == State::Login && packet.id() == 0x02 {
-                    self.state = State::Configuration;
-                }
-                if old_state == State::Configuration && packet.id() == 0x03 {
-                    self.state = State::Play;
-                }
+                self.state = old_state.advance(packet.id());
                 (old_state, packet)
             })
     }
@@ -152,6 +146,47 @@ impl<W> WritablePacketStream<W> {
 impl<W: Write> WritablePacketStream<W> {
     pub fn push(&mut self, packet: Packet) -> Result<(), io::Error> {
         packet.write_to(&mut self.writer)
+    }
+}
+
+/// .mcpr の tmcpr ストリームを論理イベント列として読み出すアダプタ。
+///
+/// [`ReadablePacketStream`] と異なり読み取りエラーを EOF と区別して
+/// 伝播する。state 遷移 (Login → Configuration → Play) を追跡し、
+/// 各パケットに観測時点の state を付与する。
+pub struct McprEventSource<R> {
+    reader: R,
+    state: State,
+    info: ReplayInfo,
+}
+
+impl<R: Read> McprEventSource<R> {
+    pub fn new(reader: R, info: ReplayInfo) -> Self {
+        Self {
+            reader,
+            state: State::Login,
+            info,
+        }
+    }
+}
+
+impl<R: Read> EventSource for McprEventSource<R> {
+    fn info(&self) -> &ReplayInfo {
+        &self.info
+    }
+    fn next_event(&mut self) -> anyhow::Result<Option<Event>> {
+        let Some(packet) = Packet::read_from(&mut self.reader)? else {
+            return Ok(None);
+        };
+        let state = self.state;
+        self.state = state.advance(packet.id());
+        let (time, id, data) = packet.into_parts();
+        Ok(Some(Event::Packet {
+            time: Time::from_millis(time as u64),
+            state,
+            id,
+            data,
+        }))
     }
 }
 
@@ -174,6 +209,12 @@ impl<R: ArchiveReader> ReplayReader<R> {
         let reader = BufReader::new(self.reader.get_reader("recording.tmcpr")?);
         Ok(ReadablePacketStream::new(State::Login, reader))
     }
+    /// メタデータを読んだうえで論理イベント列リーダーを開く。
+    pub fn event_source<'a>(&'a mut self) -> anyhow::Result<McprEventSource<impl Read + 'a>> {
+        let info = ReplayInfo::from(&self.read_metadata()?);
+        let reader = BufReader::new(self.reader.get_reader("recording.tmcpr")?);
+        Ok(McprEventSource::new(reader, info))
+    }
 }
 
 pub struct ReplayWriter<W: ArchiveWriter> {
@@ -195,5 +236,85 @@ impl<W: ArchiveWriter> ReplayWriter<W> {
     ) -> anyhow::Result<WritablePacketStream<impl Write + 'a>> {
         let writer = BufWriter::new(self.writer.get_writer("recording.tmcpr")?);
         Ok(WritablePacketStream::new(writer))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// (time, id, data) の列から tmcpr バイト列を合成する。
+    fn build_tmcpr(packets: &[(u32, i32, &[u8])]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        for (time, id, data) in packets {
+            Packet::new(*time, *id, (*data).into())
+                .write_to(&mut buf)
+                .unwrap();
+        }
+        buf
+    }
+
+    #[test]
+    fn packet_roundtrip() {
+        let packet = Packet::new(1234, 0x2c, vec![1, 2, 3].into_boxed_slice());
+        let mut buf = Vec::new();
+        packet.write_to(&mut buf).unwrap();
+        let read = Packet::read_from(&mut Cursor::new(&buf)).unwrap().unwrap();
+        assert_eq!(packet, read);
+        assert_eq!(Packet::read_from(&mut Cursor::new(&buf[..3])).unwrap(), None);
+    }
+
+    #[test]
+    fn event_source_tracks_state() {
+        // Login(0x00) -> LoginSuccess(0x02) -> RegistryData(0x07)
+        //   -> FinishConfiguration(0x03) -> Play(0x2c)
+        let buf = build_tmcpr(&[
+            (0, 0x00, &[1]),
+            (0, 0x02, &[2]),
+            (10, 0x07, &[3]),
+            (10, 0x03, &[]),
+            (60, 0x2c, &[4, 5]),
+        ]);
+        let info = ReplayInfo::default();
+        let mut source = McprEventSource::new(Cursor::new(buf), info);
+
+        let mut events = Vec::new();
+        while let Some(event) = source.next_event().unwrap() {
+            events.push(event);
+        }
+        let states: Vec<State> = events
+            .iter()
+            .map(|e| match e {
+                Event::Packet { state, .. } => *state,
+                _ => panic!("unexpected custom event"),
+            })
+            .collect();
+        assert_eq!(
+            states,
+            vec![
+                State::Login,
+                State::Login,
+                State::Configuration,
+                State::Configuration,
+                State::Play,
+            ]
+        );
+        match &events[4] {
+            Event::Packet { time, id, data, .. } => {
+                assert_eq!(time.as_millis(), 60);
+                assert_eq!(*id, 0x2c);
+                assert_eq!(data.as_ref(), &[4, 5]);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn event_source_propagates_error() {
+        // ヘッダはあるが body が足りない → EOF でなくエラー
+        let mut buf = build_tmcpr(&[(0, 0x00, &[1, 2, 3])]);
+        buf.truncate(buf.len() - 2);
+        let mut source = McprEventSource::new(Cursor::new(buf), ReplayInfo::default());
+        assert!(source.next_event().is_err());
     }
 }
