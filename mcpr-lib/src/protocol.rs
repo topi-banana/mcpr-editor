@@ -107,8 +107,40 @@ pub trait Serializer: io::Write {
         }
         Ok(())
     }
+    fn write_string(&mut self, value: &str) -> io::Result<()> {
+        self.write_varint(value.len() as i32)?;
+        self.write_all(value.as_bytes())
+    }
+    fn write_uuid(&mut self, value: &uuid::Uuid) -> io::Result<()> {
+        self.write_all(value.as_bytes())
+    }
 }
 impl<W: io::Write + ?Sized> Serializer for W {}
+
+/// Login phase の遷移パケット id (protocol 764 / 1.20.2 以降で安定)。
+pub const LOGIN_SUCCESS_PACKET_ID: i32 = 0x02;
+/// Configuration phase の遷移パケット id (protocol 764 / 1.20.2 以降で安定)。
+pub const FINISH_CONFIGURATION_PACKET_ID: i32 = 0x03;
+
+/// Login Success (login phase 0x02) の body を合成する。
+///
+/// 構成: UUID + Username + Property 配列 (空)。
+/// protocol 766..=767 (1.20.5〜1.21.1) のみ末尾に
+/// strict_error_handling の bool が付く (1.21.2 で削除)。
+pub fn login_success_payload(
+    protocol_version: u32,
+    uuid: &uuid::Uuid,
+    username: &str,
+) -> io::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    buf.write_uuid(uuid)?;
+    buf.write_string(username)?;
+    buf.write_varint(0)?; // properties
+    if (766..=767).contains(&protocol_version) {
+        buf.write_u8(0)?; // strict_error_handling = false
+    }
+    Ok(buf)
+}
 
 /*
 // Helper functions for reading and writing data

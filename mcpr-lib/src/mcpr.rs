@@ -7,8 +7,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     archive::{ArchiveReader, ArchiveWriter},
-    event::{Event, EventSource, ReplayInfo, Time},
-    protocol::{Deserializer, Serializer},
+    event::{Event, EventSink, EventSource, ReplayInfo, Time},
+    protocol::{
+        Deserializer, FINISH_CONFIGURATION_PACKET_ID, LOGIN_SUCCESS_PACKET_ID, Serializer,
+        login_success_payload,
+    },
 };
 
 // 後方互換: State は共通語彙として crate::event に移動した。
@@ -239,6 +242,129 @@ impl<W: ArchiveWriter> ReplayWriter<W> {
     }
 }
 
+/// 論理イベント列を .mcpr アーカイブとして書き出す Sink。
+///
+/// ReplayMod の再生互換のため、ソースに存在しない接続フェーズ遷移
+/// パケットを合成する:
+/// - 最初のイベントが Login state でない場合 (= Flashback 由来)、
+///   Login Success (0x02) をダミーの profile で合成する
+/// - Configuration → Play の境目に Finish Configuration (0x03) が
+///   無ければ合成する
+///
+/// `Event::Custom` (Flashback 独自 action) はパケットに対応物が
+/// 無いためスキップし、件数を [`Self::skipped_custom`] で報告する。
+///
+/// tmcpr は内部バッファに構築し、[`EventSink::finish`] で
+/// recording.tmcpr → metaData.json の順にアーカイブへ書き出す
+/// (zip アーカイブは同時に 1 エントリしか開けないため)。
+pub struct McprEventSink<W: ArchiveWriter> {
+    archive: W,
+    buffer: Vec<u8>,
+    protocol_version: u32,
+    written_state: State,
+    last_time: u32,
+    skipped_custom: usize,
+    finished: bool,
+}
+
+impl<W: ArchiveWriter> McprEventSink<W> {
+    /// `protocol_version` は遷移パケット合成の形式判定に使う
+    /// (通常はソースの [`ReplayInfo::protocol_version`])。
+    pub fn new(archive: W, protocol_version: u32) -> Self {
+        Self {
+            archive,
+            buffer: Vec::new(),
+            protocol_version,
+            written_state: State::Login,
+            last_time: 0,
+            skipped_custom: 0,
+            finished: false,
+        }
+    }
+    /// パケットへ変換できずスキップした Custom イベントの件数。
+    pub fn skipped_custom(&self) -> usize {
+        self.skipped_custom
+    }
+    pub fn into_archive(self) -> W {
+        self.archive
+    }
+
+    /// `written_state` から `target` まで遷移パケットを合成する。
+    fn advance_to(&mut self, target: State, time: u32) -> anyhow::Result<()> {
+        loop {
+            match (self.written_state, target) {
+                (state, target) if state == target => return Ok(()),
+                (State::Login, State::Configuration | State::Play) => {
+                    let payload =
+                        login_success_payload(self.protocol_version, &uuid::Uuid::nil(), "Player")?;
+                    Packet::new(time, LOGIN_SUCCESS_PACKET_ID, payload.into())
+                        .write_to(&mut self.buffer)?;
+                    self.written_state = State::Configuration;
+                }
+                (State::Configuration, State::Play) => {
+                    Packet::new(time, FINISH_CONFIGURATION_PACKET_ID, Box::new([]))
+                        .write_to(&mut self.buffer)?;
+                    self.written_state = State::Play;
+                }
+                (state, target) => {
+                    anyhow::bail!(
+                        "cannot transition from {:?} back to {:?}: \
+                         .mcpr stream must advance monotonically",
+                        state,
+                        target
+                    );
+                }
+            }
+        }
+    }
+}
+
+impl<W: ArchiveWriter> EventSink for McprEventSink<W> {
+    fn push(&mut self, event: Event) -> anyhow::Result<()> {
+        match event {
+            Event::Packet {
+                time,
+                state,
+                id,
+                data,
+            } => {
+                // tmcpr の time は u32 ms
+                let time = u32::try_from(time.as_millis()).unwrap_or(u32::MAX);
+                self.advance_to(state, time)?;
+                Packet::new(time, id, data).write_to(&mut self.buffer)?;
+                self.written_state = self.written_state.advance(id);
+                self.last_time = self.last_time.max(time);
+            }
+            Event::Custom { .. } => self.skipped_custom += 1,
+        }
+        Ok(())
+    }
+    fn finish(&mut self, info: &ReplayInfo) -> anyhow::Result<()> {
+        if self.finished {
+            anyhow::bail!("McprEventSink::finish called twice");
+        }
+        self.finished = true;
+        {
+            let mut writer = self.archive.get_writer("recording.tmcpr")?;
+            writer.write_all(&self.buffer)?;
+            writer.flush()?;
+        }
+        let metadata = MetaData {
+            duration: info.duration_ms.max(self.last_time as u64),
+            mcversion: info.mc_version.clone(),
+            fileFormat: "MCPR".to_string(),
+            fileFormatVersion: 14,
+            protocol: info.protocol_version,
+            generator: "mcpr-lib".to_string(),
+            players: info.players.clone(),
+            ..Default::default()
+        };
+        let writer = BufWriter::new(self.archive.get_writer("metaData.json")?);
+        serde_json::to_writer(writer, &metadata)?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,5 +442,134 @@ mod tests {
         buf.truncate(buf.len() - 2);
         let mut source = McprEventSource::new(Cursor::new(buf), ReplayInfo::default());
         assert!(source.next_event().is_err());
+    }
+
+    /// テスト用のメモリ上アーカイブ。
+    #[derive(Default)]
+    struct MemArchive(std::collections::HashMap<String, Vec<u8>>);
+    impl ArchiveWriter for MemArchive {
+        fn get_writer<'this>(
+            &'this mut self,
+            filename: &str,
+        ) -> anyhow::Result<Box<dyn Write + 'this>> {
+            Ok(Box::new(self.0.entry(filename.to_string()).or_default()))
+        }
+    }
+
+    fn packet_event(time_ms: u64, state: State, id: i32, data: &[u8]) -> Event {
+        Event::Packet {
+            time: Time::from_millis(time_ms),
+            state,
+            id,
+            data: data.into(),
+        }
+    }
+
+    fn read_back(tmcpr: &[u8]) -> Vec<(State, Packet)> {
+        ReadablePacketStream::new(State::Login, Cursor::new(tmcpr.to_vec())).collect()
+    }
+
+    #[test]
+    fn event_sink_passes_through_mcpr_stream() {
+        // 遷移パケットを含む完全な mcpr ストリームには何も合成しない
+        let events = vec![
+            packet_event(0, State::Login, 0x00, &[1]),
+            packet_event(0, State::Login, 0x02, &[2]),
+            packet_event(10, State::Configuration, 0x07, &[3]),
+            packet_event(10, State::Configuration, 0x03, &[]),
+            packet_event(60, State::Play, 0x2c, &[4]),
+        ];
+        let mut sink = McprEventSink::new(MemArchive::default(), 774);
+        for event in events.clone() {
+            sink.push(event).unwrap();
+        }
+        sink.finish(&ReplayInfo::default()).unwrap();
+        let archive = sink.into_archive();
+        let packets = read_back(&archive.0["recording.tmcpr"]);
+        assert_eq!(packets.len(), 5);
+        let ids: Vec<i32> = packets.iter().map(|(_, p)| p.id()).collect();
+        assert_eq!(ids, vec![0x00, 0x02, 0x07, 0x03, 0x2c]);
+    }
+
+    #[test]
+    fn event_sink_synthesizes_transitions_for_flashback_stream() {
+        // Flashback 由来: Configuration から始まり、遷移パケットを含まない
+        let mut sink = McprEventSink::new(MemArchive::default(), 774);
+        sink.push(packet_event(0, State::Configuration, 0x07, &[3]))
+            .unwrap();
+        sink.push(packet_event(0, State::Play, 0x2b, &[4])).unwrap();
+        sink.push(Event::Custom {
+            time: Time::from_millis(50),
+            name: "flashback:action/move_entities".to_string(),
+            data: vec![9].into(),
+        })
+        .unwrap();
+        sink.finish(&ReplayInfo::default()).unwrap();
+        assert_eq!(sink.skipped_custom(), 1);
+
+        let archive = sink.into_archive();
+        let packets = read_back(&archive.0["recording.tmcpr"]);
+        // Login Success / Finish Configuration が合成され、state 遷移が成立する
+        let expected: Vec<(State, i32)> = vec![
+            (State::Login, 0x02),
+            (State::Configuration, 0x07),
+            (State::Configuration, 0x03),
+            (State::Play, 0x2b),
+        ];
+        assert_eq!(
+            packets
+                .iter()
+                .map(|(s, p)| (*s, p.id()))
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+
+    #[test]
+    fn event_sink_synthesizes_both_transitions_without_configuration() {
+        // configuration なしでいきなり Play が来ても 0x02 + 0x03 を連続合成
+        let mut sink = McprEventSink::new(MemArchive::default(), 774);
+        sink.push(packet_event(0, State::Play, 0x2c, &[1])).unwrap();
+        sink.finish(&ReplayInfo::default()).unwrap();
+        let archive = sink.into_archive();
+        let ids: Vec<i32> = read_back(&archive.0["recording.tmcpr"])
+            .iter()
+            .map(|(_, p)| p.id())
+            .collect();
+        assert_eq!(ids, vec![0x02, 0x03, 0x2c]);
+    }
+
+    #[test]
+    fn event_sink_rejects_backwards_transition() {
+        let mut sink = McprEventSink::new(MemArchive::default(), 774);
+        sink.push(packet_event(0, State::Play, 0x2c, &[])).unwrap();
+        let err = sink
+            .push(packet_event(0, State::Configuration, 0x07, &[]))
+            .unwrap_err();
+        assert!(err.to_string().contains("transition"));
+    }
+
+    #[test]
+    fn event_sink_writes_metadata_from_info() {
+        let mut sink = McprEventSink::new(MemArchive::default(), 774);
+        sink.push(packet_event(12345, State::Play, 0x2c, &[]))
+            .unwrap();
+        let info = ReplayInfo {
+            mc_version: "1.21.11".to_string(),
+            protocol_version: 774,
+            duration_ms: 6150,
+            data_version: Some(4671),
+            players: HashSet::new(),
+        };
+        sink.finish(&info).unwrap();
+        let archive = sink.into_archive();
+        let metadata: MetaData =
+            serde_json::from_slice(&archive.0["metaData.json"]).unwrap();
+        assert_eq!(metadata.protocol, 774);
+        assert_eq!(metadata.mcversion, "1.21.11");
+        assert_eq!(metadata.fileFormat, "MCPR");
+        assert_eq!(metadata.fileFormatVersion, 14);
+        // 実際に書いた最終 time の方が大きければそちらを採用
+        assert_eq!(metadata.duration, 12345);
     }
 }
