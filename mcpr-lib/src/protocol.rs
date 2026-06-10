@@ -132,6 +132,17 @@ pub fn varint_len(value: i32) -> usize {
     bits.div_ceil(7) as usize
 }
 
+/// パケット id のテキスト表記を解釈する (16 進、`0x` プレフィクス任意)。
+/// CLI のフィルタ引数と UI の検索クエリで共通の表記。
+pub fn parse_packet_id(s: &str) -> Option<i32> {
+    let s = s.trim();
+    let hex = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .unwrap_or(s);
+    i32::from_str_radix(hex, 16).ok()
+}
+
 /// Login Success (login phase 0x02) の body を合成する。
 ///
 /// 構成: UUID + Username + Property 配列 (空)。
@@ -150,6 +161,21 @@ pub fn login_success_payload(
         buf.write_u8(0)?; // strict_error_handling = false
     }
     Ok(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_packet_id_hex_notation() {
+        assert_eq!(parse_packet_id("0x2c"), Some(0x2c));
+        assert_eq!(parse_packet_id("2c"), Some(0x2c));
+        assert_eq!(parse_packet_id(" 0X2C "), Some(0x2c));
+        assert_eq!(parse_packet_id("move"), None);
+        assert_eq!(parse_packet_id(""), None);
+        assert_eq!(parse_packet_id("0x"), None);
+    }
 }
 
 /*
