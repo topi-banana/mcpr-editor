@@ -1,22 +1,21 @@
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     fs::{self, File},
     io::{BufReader, BufWriter},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
-use anyhow::Ok;
+use clap::Parser;
 use mcpr_lib::{
     archive::{
         ArchiveReader, ArchiveWriter,
         directory::DirArchive,
         zip::{ZipArchiveReader, ZipArchiveWriter},
     },
-    flashback::FlashbackReader,
-    mcpr::{MetaData, ReplayReader, ReplayWriter, State},
+    event::{Event, EventSink, EventSource, ReplayInfo, State, Time},
+    flashback::{FlashbackEventSink, FlashbackReader},
+    mcpr::{McprEventSink, ReplayReader},
 };
-
-use clap::Parser;
 
 macro_rules! chmax {
     ($a:expr, $b:expr) => {
@@ -29,14 +28,24 @@ macro_rules! chmax {
     };
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum OutputFormat {
+    Mcpr,
+    Flashback,
+}
+
 #[derive(Debug, Parser)]
 #[command(author, version, about, long_about = None)]
 struct Args {
     #[arg(short, long)]
-    input: Vec<std::path::PathBuf>,
+    input: Vec<PathBuf>,
 
     #[arg(short, long)]
-    output: Option<std::path::PathBuf>,
+    output: Option<PathBuf>,
+
+    /// 出力フォーマット
+    #[arg(long, value_enum, default_value_t = OutputFormat::Mcpr)]
+    output_format: OutputFormat,
 
     #[arg(long)]
     exclude_packets: Vec<String>,
@@ -53,9 +62,15 @@ struct Args {
     #[arg(short, long)]
     compression_level: Option<i64>,
 
+    /// 入力リプレイ間に挿入する間隔 (ms)
     #[arg(long, default_value_t = 0)]
     interval: u32,
+
+    /// flashback 入力で snapshot (初期状態の合成イベント) を読み飛ばす
+    #[arg(long, default_value_t = false)]
+    skip_snapshot: bool,
 }
+
 impl Args {
     fn include_packets(&self) -> Vec<u8> {
         self.include_packets
@@ -71,185 +86,144 @@ impl Args {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum ReplayType {
     Flashback,
     ReplayMod,
 }
 
-fn main() -> anyhow::Result<()> {
-    let args = Args::parse();
-
-    eprintln!("{:#?}", args);
-
-    if args.input.is_empty() {
-        panic!("At least one input file is required");
-    }
-
-    let mut packets = [args.include_packets.is_empty(); 256];
-    for packet in args.include_packets() {
-        packets[packet as usize] = true
-    }
-    for packet in args.exclude_packets() {
-        packets[packet as usize] = false
-    }
-
-    let mut replay_writer = if let Some(output) = &args.output {
-        let path = Path::new(output);
-        if !path.exists()
-            && path
-                .extension()
-                .is_none_or(|ext| ext != "mcpr" && ext != "zip")
-        {
-            fs::create_dir(path)?;
-        }
-        let archive: Box<dyn ArchiveWriter> = if path.is_dir() {
-            Box::new(DirArchive::new(path))
+/// 入力パスからフォーマットを判別してアーカイブを開く。
+fn detect_and_open(path: &Path) -> anyhow::Result<(ReplayType, Box<dyn ArchiveReader>)> {
+    if path.is_dir() {
+        let reader = DirArchive::new(path);
+        let replay_type = if reader.exists("metaData.json") {
+            ReplayType::ReplayMod
+        } else if reader.exists("metadata.json") {
+            ReplayType::Flashback
         } else {
-            let writer = BufWriter::new(File::create(path)?);
-            Box::new(ZipArchiveWriter::new(writer, args.compression_level))
+            anyhow::bail!("metadata file not found in {:?}", path);
         };
-        Some(ReplayWriter::new(archive))
+        Ok((replay_type, Box::new(reader)))
     } else {
-        None
-    };
+        let replay_type = match path.extension() {
+            Some(ext) if ext == "mcpr" => ReplayType::ReplayMod,
+            Some(ext) if ext == "zip" => ReplayType::Flashback,
+            _ => anyhow::bail!("unsupported file extension: {:?}", path),
+        };
+        let reader = BufReader::new(File::open(path)?);
+        Ok((replay_type, Box::new(ZipArchiveReader::new(reader)?)))
+    }
+}
 
-    let mut details = if args.packet_details {
-        Some(([0; 256], [0; 256]))
-    } else {
-        None
-    };
-
-    let mut players = HashSet::new();
-    let mut offset = 0u64;
+fn open_archive_writer(
+    path: &Path,
+    compression_level: Option<i64>,
+) -> anyhow::Result<Box<dyn ArchiveWriter>> {
+    if !path.exists()
+        && path
+            .extension()
+            .is_none_or(|ext| ext != "mcpr" && ext != "zip")
     {
-        let mut writable_replay = replay_writer
-            .as_mut()
-            .map(|e| e.get_packet_writer().unwrap());
+        fs::create_dir(path)?;
+    }
+    Ok(if path.is_dir() {
+        Box::new(DirArchive::new(path))
+    } else {
+        let writer = BufWriter::new(File::create(path)?);
+        Box::new(ZipArchiveWriter::new(writer, compression_level))
+    })
+}
 
-        for i in 0..args.input.len() {
-            eprintln!();
-            let (replay_type, reader): (ReplayType, Box<dyn ArchiveReader>) =
-                if args.input[i].is_dir() {
-                    let reader = DirArchive::new(&args.input[i]);
-                    let replay_type = if reader.exists("metaData.json") {
-                        ReplayType::ReplayMod
-                    } else if reader.exists("metadata.json") {
-                        ReplayType::Flashback
-                    } else {
-                        panic!("Metadata file not found");
-                    };
-                    (replay_type, Box::new(reader))
-                } else {
-                    let replay_type = if let Some(ext) = args.input[i].extension() {
-                        if ext == "mcpr" {
-                            ReplayType::ReplayMod
-                        } else if ext == "zip" {
-                            ReplayType::Flashback
-                        } else {
-                            panic!("Unsupported file extension");
-                        }
-                    } else {
-                        panic!("Unsupported file extension");
-                    };
-                    let reader = BufReader::new(File::open(&args.input[i])?);
-                    (replay_type, Box::new(ZipArchiveReader::new(reader)?))
-                };
+/// 出力フォーマットごとの Sink。スキップ件数の報告のため enum で持つ。
+enum AnySink {
+    Mcpr(McprEventSink<Box<dyn ArchiveWriter>>),
+    Flashback(FlashbackEventSink<Box<dyn ArchiveWriter>>),
+}
 
-            if replay_type == ReplayType::Flashback {
-                let mut flashback = FlashbackReader::new(reader);
-                let meta = flashback.get_metadata()?;
-                eprintln!("{:#?}", meta);
-
-                let chunk_names: Vec<String> = meta.chunks.keys().cloned().collect();
-                let mut action_stats: std::collections::BTreeMap<String, (usize, usize)> =
-                    std::collections::BTreeMap::new();
-                let mut tick: u64 = 0;
-                for chunk_name in &chunk_names {
-                    let chunk = flashback.get_chunk_reader(chunk_name)?;
-                    for action in chunk {
-                        let entry = action_stats
-                            .entry(action.kind().as_str().to_string())
-                            .or_default();
-                        entry.0 += 1;
-                        entry.1 += action.data().len();
-                        if matches!(action.kind(), mcpr_lib::flashback::ActionKind::NextTick) {
-                            tick += 1;
-                        }
-                    }
-                }
-
-                if args.packet_details {
-                    println!("Flashback action stats (ticks observed: {}):", tick);
-                    let name_width = action_stats.keys().map(|s| s.len()).max().unwrap_or(0);
-                    for (kind, (cnt, size)) in &action_stats {
-                        println!(
-                            "  {:<width$} count={:>6} size={:>10}",
-                            kind,
-                            cnt,
-                            size,
-                            width = name_width
-                        );
-                    }
-                }
-                continue;
+impl AnySink {
+    fn create(output: &Path, args: &Args, info: &ReplayInfo) -> anyhow::Result<Self> {
+        let archive = open_archive_writer(output, args.compression_level)?;
+        Ok(match args.output_format {
+            OutputFormat::Mcpr => {
+                AnySink::Mcpr(McprEventSink::new(archive, info.protocol_version))
             }
-            let mut readable_replay = ReplayReader::new(reader);
-            for (state, mut packet) in readable_replay.get_packet_reader()? {
-                *packet.time_mut() += offset as u32;
-                let q = if packet.id() < 0 || packet.id() >= 256 {
-                    args.unknow_packet
-                } else {
-                    packets[packet.id() as usize]
-                };
-                if state == State::Play && !q {
-                    continue;
-                }
-                if i != 0 {
-                    if state == State::Play {
-                        if packet.id() == 0x2b {
-                            continue;
-                        }
-                    } else {
-                        continue;
-                    }
-                }
-                // eprintln!("{0} \x1b[38;5;{1}m0x{1:<02x}\x1b[m {:?}", packet.time(), packet.id(), packet.data());
-                // eprintln!("{i} {0} \x1b[38;5;{1}m0x{1:<02x}\x1b[m {2:?} {3}", packet.time(), packet.id(), state, packet.data().len());
-                if let Some((cnts, size)) = &mut details {
-                    cnts[packet.id() as usize] += 1usize;
-                    size[packet.id() as usize] += packet.data().len();
-                }
-                if let Some(writer) = &mut writable_replay {
-                    writer.push(packet)?;
-                }
-            }
-            let metadata = readable_replay.read_metadata()?;
-            players.extend(metadata.players);
-            offset += metadata.duration + args.interval as u64;
+            OutputFormat::Flashback => AnySink::Flashback(FlashbackEventSink::new(archive)?),
+        })
+    }
+    fn push(&mut self, event: Event) -> anyhow::Result<()> {
+        match self {
+            AnySink::Mcpr(sink) => sink.push(event),
+            AnySink::Flashback(sink) => sink.push(event),
         }
     }
-    let metadata = MetaData {
-        singleplayer: false,
-        customServerName: "NaN".to_string(),
-        serverName: "NaN".to_string(),
-        duration: offset,
-        date: 0,
-        mcversion: "1.21.1".to_string(),
-        fileFormat: "MCPR".to_string(),
-        fileFormatVersion: 14,
-        protocol: 767,
-        generator: "topi-banana/tmcpr-editor".to_string(),
-        selfId: -1,
-        players,
-    };
-    if let Some(writer) = &mut replay_writer {
-        writer.write_metadata(metadata).unwrap();
+    fn finish(&mut self, info: &ReplayInfo) -> anyhow::Result<()> {
+        match self {
+            AnySink::Mcpr(sink) => sink.finish(info),
+            AnySink::Flashback(sink) => sink.finish(info),
+        }
+    }
+    fn report(&self) {
+        match self {
+            AnySink::Mcpr(sink) => {
+                if sink.skipped_custom() > 0 {
+                    eprintln!(
+                        "note: {} custom events have no .mcpr representation and were dropped",
+                        sink.skipped_custom()
+                    );
+                }
+            }
+            AnySink::Flashback(sink) => {
+                if sink.skipped_packets() > 0 {
+                    eprintln!(
+                        "note: {} non-play/configuration packets were dropped",
+                        sink.skipped_packets()
+                    );
+                }
+                if sink.skipped_customs() > 0 {
+                    eprintln!(
+                        "note: {} unknown custom events were dropped",
+                        sink.skipped_customs()
+                    );
+                }
+            }
+        }
+    }
+}
+
+struct Stats {
+    counts: [usize; 256],
+    sizes: [usize; 256],
+    customs: BTreeMap<String, (usize, usize)>,
+}
+
+impl Default for Stats {
+    fn default() -> Self {
+        Self {
+            counts: [0; 256],
+            sizes: [0; 256],
+            customs: BTreeMap::new(),
+        }
+    }
+}
+
+impl Stats {
+    fn record(&mut self, event: &Event) {
+        match event {
+            Event::Packet { id, data, .. } => {
+                if (0..256).contains(id) {
+                    self.counts[*id as usize] += 1;
+                    self.sizes[*id as usize] += data.len();
+                }
+            }
+            Event::Custom { name, data, .. } => {
+                let entry = self.customs.entry(name.clone()).or_default();
+                entry.0 += 1;
+                entry.1 += data.len();
+            }
+        }
     }
 
-    println!("Finished!");
-
-    if let Some((cnts, size)) = &mut details {
+    fn print(&self) {
         let mut table = vec![[
             "packet".to_string(),
             "count".to_string(),
@@ -257,33 +231,184 @@ fn main() -> anyhow::Result<()> {
             "avg size".to_string(),
         ]];
         for id in 0..256 {
-            let cnt = cnts[id];
-            let size = size[id];
-            if cnt == 0 {
+            let count = self.counts[id];
+            let size = self.sizes[id];
+            if count == 0 {
                 continue;
             }
             table.push([
                 format!("  \x1b[38;5;{0}m0x{0:<02x}\x1b[m", id),
-                format!("{}", cnt),
+                format!("{}", count),
                 format!("{}", size),
-                format!("{:.2}", size as f32 / cnt as f32),
+                format!("{:.2}", size as f32 / count as f32),
             ]);
         }
         let mut table_size = [0usize; 4];
-        for low in &table {
+        for row in &table {
             for i in 1..4 {
-                chmax!(table_size[i], low[i].len());
+                chmax!(table_size[i], row[i].len());
             }
         }
         table_size[0] = table[0].len();
-        for (i, low) in table.iter().enumerate() {
-            print!("{:>3} | {} ", i, low[0]);
-            // print!("{i:>3} | {:<width$} ", low[0], width = table_size[0]);
+        for (i, row) in table.iter().enumerate() {
+            print!("{:>3} | {} ", i, row[0]);
             for j in 1..4 {
-                print!("| {:>width$} ", low[j], width = table_size[j]);
+                print!("| {:>width$} ", row[j], width = table_size[j]);
             }
             println!();
         }
+        if !self.customs.is_empty() {
+            println!("custom events:");
+            let name_width = self.customs.keys().map(|s| s.len()).max().unwrap_or(0);
+            for (name, (count, size)) in &self.customs {
+                println!(
+                    "  {:<width$} count={:>6} size={:>10}",
+                    name,
+                    count,
+                    size,
+                    width = name_width
+                );
+            }
+        }
+    }
+}
+
+/// 1 入力分のイベントを共通パイプラインへ流す。
+fn process<S: EventSource>(
+    source: &mut S,
+    args: &Args,
+    is_first_input: bool,
+    offset_ms: u64,
+    play_filter: &[bool; 256],
+    stats: &mut Option<Stats>,
+    sink: &mut Option<AnySink>,
+) -> anyhow::Result<ReplayInfo> {
+    let info = source.info().clone();
+    eprintln!(
+        "  mc {} / protocol {} / duration {}ms",
+        info.mc_version, info.protocol_version, info.duration_ms
+    );
+
+    if sink.is_none()
+        && let Some(output) = &args.output
+    {
+        *sink = Some(AnySink::create(output, args, &info)?);
+    }
+
+    while let Some(mut event) = source.next_event()? {
+        *event.time_mut() = Time::from_millis(event.time().as_millis() + offset_ms);
+
+        if let Event::Packet { state, id, .. } = &event {
+            // Play パケットの include/exclude フィルタ
+            if *state == State::Play {
+                let keep = if (0..256).contains(id) {
+                    play_filter[*id as usize]
+                } else {
+                    args.unknow_packet
+                };
+                if !keep {
+                    continue;
+                }
+            }
+            // 2 個目以降の入力では接続初期化の重複を避ける
+            if !is_first_input {
+                if *state != State::Play {
+                    continue;
+                }
+                if *id == 0x2b {
+                    // Login (play) packet の重複でクライアントが再 join しないように
+                    continue;
+                }
+            }
+        }
+
+        if let Some(stats) = stats {
+            stats.record(&event);
+        }
+        if let Some(sink) = sink {
+            sink.push(event)?;
+        }
+    }
+    Ok(info)
+}
+
+fn main() -> anyhow::Result<()> {
+    let args = Args::parse();
+
+    eprintln!("{:#?}", args);
+
+    anyhow::ensure!(!args.input.is_empty(), "At least one input file is required");
+
+    let mut play_filter = [args.include_packets.is_empty(); 256];
+    for packet in args.include_packets() {
+        play_filter[packet as usize] = true;
+    }
+    for packet in args.exclude_packets() {
+        play_filter[packet as usize] = false;
+    }
+
+    let mut stats = args.packet_details.then(Stats::default);
+    let mut sink: Option<AnySink> = None;
+    let mut players = HashSet::new();
+    let mut merged_info: Option<ReplayInfo> = None;
+    let mut offset_ms = 0u64;
+
+    for (index, input) in args.input.iter().enumerate() {
+        eprintln!();
+        let (replay_type, archive) = detect_and_open(input)?;
+        eprintln!("[{}] {:?} ({:?})", index, input, replay_type);
+
+        // EventSource の具象型がフォーマットごとに異なるためここで分岐し、
+        // 以降の処理は process() に一本化する
+        let info = match replay_type {
+            ReplayType::Flashback => {
+                let mut source =
+                    FlashbackReader::new(archive).event_source(!args.skip_snapshot)?;
+                process(
+                    &mut source,
+                    &args,
+                    index == 0,
+                    offset_ms,
+                    &play_filter,
+                    &mut stats,
+                    &mut sink,
+                )?
+            }
+            ReplayType::ReplayMod => {
+                let mut reader = ReplayReader::new(archive);
+                let mut source = reader.event_source()?;
+                process(
+                    &mut source,
+                    &args,
+                    index == 0,
+                    offset_ms,
+                    &play_filter,
+                    &mut stats,
+                    &mut sink,
+                )?
+            }
+        };
+
+        players.extend(info.players.iter().cloned());
+        offset_ms += info.duration_ms + args.interval as u64;
+        merged_info.get_or_insert(info);
+    }
+
+    if let Some(mut sink) = sink {
+        let base = merged_info.expect("at least one input was processed");
+        let info = ReplayInfo {
+            duration_ms: offset_ms.saturating_sub(args.interval as u64),
+            players,
+            ..base
+        };
+        sink.finish(&info)?;
+        sink.report();
+    }
+
+    println!("Finished!");
+
+    if let Some(stats) = &stats {
+        stats.print();
     }
     Ok(())
 }
