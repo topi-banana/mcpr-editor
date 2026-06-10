@@ -4,6 +4,21 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>mcpr-ui</title>
+    <script>
+      // WASM 起動前にテーマを適用して、リロード時のちらつきを防ぐ。
+      // キーと値は app.rs の THEME_STORAGE_KEY / Theme と揃えること。
+      (function () {
+        try {
+          var theme = localStorage.getItem("mcpr-ui-theme");
+          if (theme !== "light" && theme !== "dark") {
+            theme = window.matchMedia("(prefers-color-scheme: dark)").matches
+              ? "dark"
+              : "light";
+          }
+          document.documentElement.setAttribute("data-theme", theme);
+        } catch (_) {}
+      })();
+    </script>
     <link data-trunk rel="tailwind-css" href="/style.css">
   </head>
   <body></body>
