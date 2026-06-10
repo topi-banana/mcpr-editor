@@ -15,7 +15,7 @@ use mcpr_lib::{
     event::{Event, EventSink, EventSource, ReplayFormat, ReplayInfo, State, Time, detect_format},
     flashback::{FlashbackEventSink, FlashbackReader},
     mcpr::{McprEventSink, ReplayReader},
-    protocol::LOGIN_PLAY_PACKET_ID,
+    protocol::{LOGIN_PLAY_PACKET_ID, parse_packet_id},
 };
 
 macro_rules! chmax {
@@ -74,15 +74,14 @@ struct Args {
 
 impl Args {
     fn include_packets(&self) -> Vec<u8> {
-        self.include_packets
-            .iter()
-            .map(|x| u8::from_str_radix(x.trim_start_matches("0x"), 16).unwrap())
-            .collect()
+        Self::parse_packet_ids(&self.include_packets)
     }
     fn exclude_packets(&self) -> Vec<u8> {
-        self.exclude_packets
-            .iter()
-            .map(|x| u8::from_str_radix(x.trim_start_matches("0x"), 16).unwrap())
+        Self::parse_packet_ids(&self.exclude_packets)
+    }
+    fn parse_packet_ids(args: &[String]) -> Vec<u8> {
+        args.iter()
+            .map(|x| u8::try_from(parse_packet_id(x).expect("invalid packet id")).unwrap())
             .collect()
     }
 }
