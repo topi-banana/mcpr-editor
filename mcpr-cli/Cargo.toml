@@ -9,5 +9,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.100"
 mcpr-lib = { path = "../mcpr-lib" }
+# flashback 出力のリプレイ uuid 生成 (乱数源は frontend の責務)
+uuid = { version = "1.19.0", features = ["v4"] }
 
 clap = { version = "4.5.54", features = ["derive"] }

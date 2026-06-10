@@ -6,10 +6,5 @@ dist = "dist"
 addresses = ["0.0.0.0"]
 port = 8000
 
-[[hooks]]
-stage = "build"
-command = "sh"
-command_arguments = [
-    "-c",
-    "./tailwindcss -i input.css -o $TRUNK_STAGING_DIR/output.css",
-]
+[tools]
+tailwindcss = "4.3.0"
