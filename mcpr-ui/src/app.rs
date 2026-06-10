@@ -9,6 +9,7 @@ use mcpr_lib::{
     event::{Event as ReplayEvent, EventSource, ReplayFormat, ReplayInfo, State, detect_format},
     flashback::FlashbackReader,
     mcpr::ReplayReader,
+    protocol::parse_packet_id,
 };
 use web_sys::{DragEvent, Event, HtmlInputElement};
 use yew::prelude::*;
@@ -30,12 +31,114 @@ pub struct EventRow {
     pub size: usize,
 }
 
+/// フィルタ対象の行カテゴリ。パケットは state ごと、Custom は一括。
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Category {
+    State(State),
+    Custom,
+}
+
+impl Category {
+    /// トグル UI の表示順 (接続フェーズ順 + Custom)。
+    const ORDER: [Category; 6] = [
+        Category::State(State::Handshaking),
+        Category::State(State::Status),
+        Category::State(State::Login),
+        Category::State(State::Configuration),
+        Category::State(State::Play),
+        Category::Custom,
+    ];
+
+    fn of(kind: &RowKind) -> Category {
+        match kind {
+            RowKind::Packet { state, .. } => Category::State(*state),
+            RowKind::Custom { .. } => Category::Custom,
+        }
+    }
+
+    /// カテゴリビット集合 ([`EventFilter::hidden`] 等) 内のビット。
+    fn bit(&self) -> u8 {
+        match self {
+            Category::State(State::Handshaking) => 1 << 0,
+            Category::State(State::Status) => 1 << 1,
+            Category::State(State::Login) => 1 << 2,
+            Category::State(State::Configuration) => 1 << 3,
+            Category::State(State::Play) => 1 << 4,
+            Category::Custom => 1 << 5,
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            Category::State(s) => state_name(*s),
+            Category::Custom => "Custom",
+        }
+    }
+}
+
+/// イベントテーブルの表示フィルタ。
+/// (PartialEq は indices を導出する use_memo の依存キーとして使う)
+#[derive(Clone, PartialEq, Default)]
+struct EventFilter {
+    /// 非表示カテゴリのビット集合 ([`Category::bit`]、0 = 全表示)。
+    hidden: u8,
+    /// イベント検索クエリ (入力欄の原文)。
+    query: String,
+    /// query の 16 進 packet id 解釈 (マッチ用キャッシュ)。
+    query_id: Option<i32>,
+    /// query の小文字化 (Custom 名マッチ用キャッシュ)。
+    query_lower: String,
+}
+
+impl EventFilter {
+    fn with_query(&self, query: String) -> Self {
+        Self {
+            hidden: self.hidden,
+            query_id: parse_packet_id(&query),
+            query_lower: query.trim().to_lowercase(),
+            query,
+        }
+    }
+
+    fn with_toggled(&self, category: Category) -> Self {
+        Self {
+            hidden: self.hidden ^ category.bit(),
+            ..self.clone()
+        }
+    }
+
+    fn is_hidden(&self, category: Category) -> bool {
+        self.hidden & category.bit() != 0
+    }
+
+    fn is_empty(&self) -> bool {
+        self.hidden == 0 && self.query_lower.is_empty()
+    }
+
+    /// クエリは「event 列の表示」へのマッチ:
+    /// 16 進として解釈できれば packet id の一致、Custom は常に名前の部分一致。
+    fn matches(&self, row: &EventRow) -> bool {
+        if self.is_hidden(Category::of(&row.kind)) {
+            return false;
+        }
+        if self.query_lower.is_empty() {
+            return true;
+        }
+        match &row.kind {
+            RowKind::Packet { id, .. } => self.query_id == Some(*id),
+            RowKind::Custom { name } => name.contains(&self.query_lower),
+        }
+    }
+}
+
 #[derive(Clone, PartialEq)]
 pub struct Loaded {
     pub filename: String,
     pub format: &'static str,
     pub info: ReplayInfo,
     pub events: Rc<Vec<EventRow>>,
+    /// リプレイ中に出現するカテゴリ (トグル UI 用、読み込み時に集計)。
+    pub categories: Vec<Category>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -57,9 +160,12 @@ fn state_name(s: State) -> &'static str {
     }
 }
 
-/// 論理イベント列を表示用の行へ読み出す。
-fn collect_events<S: EventSource>(mut source: S) -> anyhow::Result<(ReplayInfo, Vec<EventRow>)> {
+/// 論理イベント列を表示用の行へ読み出し、出現カテゴリも集計する。
+fn collect_events<S: EventSource>(
+    mut source: S,
+) -> anyhow::Result<(ReplayInfo, Vec<EventRow>, Vec<Category>)> {
     let info = source.info().clone();
+    let mut seen = 0u8;
     let rows = source
         .events()
         .map(|event| {
@@ -75,6 +181,7 @@ fn collect_events<S: EventSource>(mut source: S) -> anyhow::Result<(ReplayInfo, 
                         (time, RowKind::Custom { name }, data.len())
                     }
                 };
+                seen |= Category::of(&kind).bit();
                 EventRow {
                     time_ms: time.as_millis(),
                     kind,
@@ -83,10 +190,15 @@ fn collect_events<S: EventSource>(mut source: S) -> anyhow::Result<(ReplayInfo, 
             })
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
-    Ok((info, rows))
+    let categories = Category::ORDER
+        .iter()
+        .copied()
+        .filter(|c| seen & c.bit() != 0)
+        .collect();
+    Ok((info, rows, categories))
 }
 
-fn parse_replay(bytes: Vec<u8>) -> anyhow::Result<(&'static str, ReplayInfo, Vec<EventRow>)> {
+fn parse_replay(filename: String, bytes: Vec<u8>) -> anyhow::Result<Loaded> {
     let mut zip = ZipArchiveReader::new(Cursor::new(bytes))?;
     let format = detect_format(&mut zip)?;
     // McprEventSource は reader を借用するため、match の外で生かす
@@ -98,8 +210,14 @@ fn parse_replay(bytes: Vec<u8>) -> anyhow::Result<(&'static str, ReplayInfo, Vec
         }
         ReplayFormat::Flashback => Box::new(FlashbackReader::new(zip).event_source(true)?),
     };
-    let (info, rows) = collect_events(source)?;
-    Ok((format.name(), info, rows))
+    let (info, rows, categories) = collect_events(source)?;
+    Ok(Loaded {
+        filename,
+        format: format.name(),
+        info,
+        events: Rc::new(rows),
+        categories,
+    })
 }
 
 #[function_component]
@@ -119,15 +237,8 @@ pub fn App() -> Html {
             let task = read_as_bytes(&GlooFile::from(file), move |result| {
                 *slot.borrow_mut() = None;
                 match result {
-                    Ok(bytes) => match parse_replay(bytes) {
-                        Ok((format, info, events)) => {
-                            state.set(ViewState::Loaded(Box::new(Loaded {
-                                filename,
-                                format,
-                                info,
-                                events: Rc::new(events),
-                            })))
-                        }
+                    Ok(bytes) => match parse_replay(filename, bytes) {
+                        Ok(loaded) => state.set(ViewState::Loaded(Box::new(loaded))),
                         Err(e) => state.set(ViewState::Error(format!("parse error: {e}"))),
                     },
                     Err(e) => state.set(ViewState::Error(format!("read error: {e:?}"))),
@@ -214,14 +325,60 @@ struct LoadedViewProps {
     data: Loaded,
 }
 
+/// use_memo の依存キー用に Rc をポインタ同一性で比較するラッパ。
+/// (events の深い比較は数百万行に及ぶため避ける)
+struct RcPtr<T>(Rc<T>);
+
+impl<T> PartialEq for RcPtr<T> {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
+    }
+}
+
 #[function_component]
 fn LoadedView(props: &LoadedViewProps) -> Html {
     let page = use_state(|| 0usize);
-    let total = props.data.events.len();
-    let total_pages = total.div_ceil(PAGE_SIZE).max(1);
+    let filter = use_state(EventFilter::default);
+
+    // フィルタを通過した行の元 index 列 (None = フィルタなし)。
+    // filter か events が変わった時だけ全行を走査する。
+    let indices = use_memo(
+        (RcPtr(props.data.events.clone()), (*filter).clone()),
+        |(events, filter)| {
+            (!filter.is_empty()).then(|| {
+                let mut matched = Vec::with_capacity(events.0.len());
+                matched.extend(
+                    events
+                        .0
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, row)| filter.matches(row))
+                        .map(|(i, _)| i),
+                );
+                matched.shrink_to_fit();
+                matched
+            })
+        },
+    );
+    let indices: &Option<Vec<usize>> = &indices;
+
+    let all = &props.data.events;
+    let total_all = all.len();
+    let shown = indices.as_ref().map_or(total_all, Vec::len);
+    let total_pages = shown.div_ceil(PAGE_SIZE).max(1);
     let cur_page = (*page).min(total_pages - 1);
     let start = cur_page * PAGE_SIZE;
-    let end = (start + PAGE_SIZE).min(total);
+    let end = (start + PAGE_SIZE).min(shown);
+
+    // フィルタ変更時はページを先頭へ戻す。
+    let apply_filter = {
+        let filter = filter.clone();
+        let page = page.clone();
+        Callback::from(move |next: EventFilter| {
+            page.set(0);
+            filter.set(next);
+        })
+    };
 
     let prev = {
         let page = page.clone();
@@ -240,10 +397,41 @@ fn LoadedView(props: &LoadedViewProps) -> Html {
         })
     };
 
-    let rows = props.data.events[start..end]
+    let category_buttons = props
+        .data
+        .categories
         .iter()
-        .enumerate()
-        .map(|(i, row)| {
+        .map(|cat| {
+            let active = !filter.is_hidden(*cat);
+            let onclick = {
+                let apply_filter = apply_filter.clone();
+                let filter = (*filter).clone();
+                let cat = *cat;
+                Callback::from(move |_| apply_filter.emit(filter.with_toggled(cat)))
+            };
+            html! {
+                <button class={classes!("btn", "btn-xs",
+                        if active { "btn-primary" } else { "btn-ghost opacity-60" })}
+                    {onclick}>
+                    { cat.label() }
+                </button>
+            }
+        })
+        .collect::<Html>();
+
+    let on_query = {
+        let apply_filter = apply_filter.clone();
+        let filter = (*filter).clone();
+        Callback::from(move |e: InputEvent| {
+            let input: HtmlInputElement = e.target_unchecked_into();
+            apply_filter.emit(filter.with_query(input.value()));
+        })
+    };
+
+    let rows = (start..end)
+        .map(|pos| {
+            let orig = indices.as_ref().map_or(pos, |v| v[pos]);
+            let row = &all[orig];
             let (event, state) = match &row.kind {
                 RowKind::Packet { id, state } => (
                     html! { <code>{ format!("0x{id:02x}") }</code> },
@@ -256,7 +444,7 @@ fn LoadedView(props: &LoadedViewProps) -> Html {
             };
             html! {
                 <tr>
-                    <td>{ start + i }</td>
+                    <td>{ orig }</td>
                     <td>{ row.time_ms }</td>
                     <td>{ event }</td>
                     <td>{ state }</td>
@@ -281,7 +469,7 @@ fn LoadedView(props: &LoadedViewProps) -> Html {
                             props.data.info.data_version.map_or_else(|| "—".to_string(), |v| v.to_string())
                         } />
                         <MetaRow label="players" value={props.data.info.players.len().to_string()} />
-                        <MetaRow label="events" value={total.to_string()} />
+                        <MetaRow label="events" value={total_all.to_string()} />
                     </div>
                 </div>
             </div>
@@ -289,16 +477,33 @@ fn LoadedView(props: &LoadedViewProps) -> Html {
             <div class="card bg-base-100 shadow">
                 <div class="card-body">
                     <div class="flex items-center justify-between flex-wrap gap-2">
-                        <h2 class="card-title">{ "Events" }</h2>
+                        <h2 class="card-title">
+                            { "Events" }
+                            <span class="badge badge-ghost">
+                                { if shown == total_all {
+                                    total_all.to_string()
+                                } else {
+                                    format!("{shown} / {total_all}")
+                                } }
+                            </span>
+                        </h2>
                         <div class="join">
                             <button class="btn btn-sm join-item" onclick={prev}
                                 disabled={cur_page == 0}>{ "Prev" }</button>
                             <button class="btn btn-sm join-item no-animation pointer-events-none">
-                                { format!("{} / {} (#{start}–#{})", cur_page + 1, total_pages, end.saturating_sub(1)) }
+                                { format!("{} / {}", cur_page + 1, total_pages) }
                             </button>
                             <button class="btn btn-sm join-item" onclick={next}
                                 disabled={cur_page + 1 >= total_pages}>{ "Next" }</button>
                         </div>
+                    </div>
+                    <div class="flex items-center flex-wrap gap-1">
+                        { category_buttons }
+                        <input type="text"
+                            class="input input-bordered input-sm font-mono w-64 ml-auto"
+                            placeholder="filter: 0x2c / move_entities"
+                            value={filter.query.clone()}
+                            oninput={on_query} />
                     </div>
                     <div class="overflow-x-auto">
                         <table class="table table-zebra table-sm">
@@ -333,5 +538,77 @@ fn MetaRow(props: &MetaRowProps) -> Html {
             <span class="font-semibold text-base-content/70 mr-2">{ props.label }{ ":" }</span>
             <span class="font-mono">{ &props.value }</span>
         </div>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn packet(id: i32, state: State) -> EventRow {
+        EventRow {
+            time_ms: 0,
+            kind: RowKind::Packet { id, state },
+            size: 0,
+        }
+    }
+
+    fn custom(name: &str) -> EventRow {
+        EventRow {
+            time_ms: 0,
+            kind: RowKind::Custom {
+                name: name.to_string(),
+            },
+            size: 0,
+        }
+    }
+
+    #[test]
+    fn default_filter_shows_everything() {
+        let f = EventFilter::default();
+        assert!(f.is_empty());
+        assert!(f.matches(&packet(0x2c, State::Play)));
+        assert!(f.matches(&custom("flashback:action/move_entities")));
+    }
+
+    #[test]
+    fn hidden_category_drops_rows() {
+        let f = EventFilter::default().with_toggled(Category::State(State::Play));
+        assert!(!f.matches(&packet(0x2c, State::Play)));
+        assert!(f.matches(&packet(0x07, State::Configuration)));
+        assert!(f.matches(&custom("flashback:action/move_entities")));
+        // 再トグルで元に戻る
+        let f = f.with_toggled(Category::State(State::Play));
+        assert!(f.is_empty());
+    }
+
+    #[test]
+    fn hex_query_matches_packet_id() {
+        for q in ["0x2c", "2c", " 0x2C "] {
+            let f = EventFilter::default().with_query(q.to_string());
+            assert!(f.matches(&packet(0x2c, State::Play)), "query {q:?}");
+            assert!(!f.matches(&packet(0x2b, State::Play)), "query {q:?}");
+        }
+    }
+
+    #[test]
+    fn text_query_matches_custom_name_case_insensitive() {
+        for q in ["move", "MOVE"] {
+            let f = EventFilter::default().with_query(q.to_string());
+            assert!(f.matches(&custom("flashback:action/move_entities")));
+            assert!(!f.matches(&custom("flashback:action/next_tick")));
+            // 16 進として解釈できないクエリはパケットに一致しない
+            assert!(!f.matches(&packet(0x2c, State::Play)));
+        }
+    }
+
+    #[test]
+    fn query_and_category_combine() {
+        let f = EventFilter::default()
+            .with_toggled(Category::State(State::Play))
+            .with_query("0x07".to_string());
+        // クエリは一致するがカテゴリが非表示
+        assert!(!f.matches(&packet(0x07, State::Play)));
+        assert!(f.matches(&packet(0x07, State::Configuration)));
     }
 }
