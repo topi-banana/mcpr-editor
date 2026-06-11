@@ -965,6 +965,7 @@ dependencies = [
  "getrandom 0.3.2",
  "gloo-file 0.3.0",
  "mcpr-lib",
+ "uuid",
  "web-sys",
  "yew",
 ]

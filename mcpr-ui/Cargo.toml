@@ -23,3 +23,6 @@ web-sys = { version = "0.3", features = [
     "Storage",
     "Window",
 ] }
+
+[dev-dependencies]
+uuid = "1.19.0"
