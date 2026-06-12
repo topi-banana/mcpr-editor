@@ -574,26 +574,26 @@ pub fn App() -> Html {
                 },
                 EntryState::Loaded { loaded: l, .. } => html! {
                     <>
-                        <span class="badge badge-ghost badge-sm">{ l.format }</span>
-                        <span class="badge badge-ghost badge-sm">{ format!("{} ms", l.info.duration_ms) }</span>
-                        <span class="badge badge-ghost badge-sm">{ format!("{} events", l.events.len()) }</span>
+                        <span class="mcpr-badge">{ l.format }</span>
+                        <span class="mcpr-badge">{ format!("{} ms", l.info.duration_ms) }</span>
+                        <span class="mcpr-badge">{ format!("{} events", l.events.len()) }</span>
                     </>
                 },
                 EntryState::Error(msg) => html! {
-                    <span class="text-error text-sm truncate" title={msg.clone()}>{ msg }</span>
+                    <span class="text-sm truncate text-error" title={msg.clone()}>{ msg }</span>
                 },
             };
             html! {
-                <li key={id.to_string()} class="flex items-center gap-2 rounded-lg bg-base-200 px-3 py-2">
-                    <span class="font-mono text-sm w-6 text-right text-base-content/50">{ i }</span>
-                    <span class="truncate font-mono" title={entry.filename.clone()}>{ &entry.filename }</span>
-                    { status }
-                    <div class="join ml-auto shrink-0">
-                        <button class="btn btn-xs join-item" title="上へ"
+                <li key={id.to_string()} class="mcpr-file-row">
+                    <span class="mcpr-row-index">{ i }</span>
+                    <span class="mcpr-filename" title={entry.filename.clone()}>{ &entry.filename }</span>
+                    <div class="mcpr-file-status">{ status }</div>
+                    <div class="join shrink-0 justify-self-end">
+                        <button class="btn btn-xs join-item mcpr-btn mcpr-btn-secondary" title="上へ"
                             disabled={i == 0} onclick={up}>{ "↑" }</button>
-                        <button class="btn btn-xs join-item" title="下へ"
+                        <button class="btn btn-xs join-item mcpr-btn mcpr-btn-secondary" title="下へ"
                             disabled={i == last} onclick={down}>{ "↓" }</button>
-                        <button class="btn btn-xs btn-error join-item" title="削除"
+                        <button class="btn btn-xs join-item mcpr-btn mcpr-btn-danger" title="削除"
                             onclick={remove}>{ "✕" }</button>
                     </div>
                 </li>
@@ -690,9 +690,9 @@ pub fn App() -> Html {
         .map(|&f| {
             let export_format = export_format.clone();
             let class = if *export_format == f {
-                "btn btn-sm join-item btn-primary"
+                "btn btn-sm join-item mcpr-btn mcpr-btn-primary"
             } else {
-                "btn btn-sm join-item"
+                "btn btn-sm join-item mcpr-btn mcpr-btn-secondary"
             };
             html! {
                 <button key={f.extension()} class={class}
@@ -730,8 +730,8 @@ pub fn App() -> Html {
         };
         html! {
             <div class="flex items-center gap-2 grow min-w-40">
-                <progress class="progress progress-primary" value={value} max={max}></progress>
-                <span class="text-xs font-mono shrink-0 text-base-content/70 w-12 text-right">
+                <progress class="progress mcpr-progress" value={value} max={max}></progress>
+                <span class="text-xs font-mono shrink-0 mcpr-muted w-12 text-right">
                     { label }
                 </span>
             </div>
@@ -740,10 +740,10 @@ pub fn App() -> Html {
 
     // 書き出し行。1 件でも意味がある (フォーマット変換 = CLI の単一入力動作)。
     let export_row = html! {
-        <div class="flex items-center flex-wrap gap-3 pt-2 border-t border-base-300 text-sm">
+        <div class="mcpr-divider-row flex items-center flex-wrap gap-3 text-sm">
             <div class="join">{ format_buttons }</div>
             { progress_view }
-            <button class="btn btn-primary btn-sm ml-auto"
+            <button class="btn btn-sm ml-auto mcpr-btn mcpr-btn-primary"
                 disabled={!all_loaded || export_phase.is_some()}
                 onclick={on_export}>
                 { "Export" }
@@ -754,11 +754,11 @@ pub fn App() -> Html {
     // 連結設定は 2 件以上で意味を持つときだけ出す。
     let merge_settings = (files.entries.len() >= 2).then(|| {
         html! {
-            <div class="flex items-center flex-wrap gap-x-6 gap-y-2 pt-2 border-t border-base-300 text-sm">
+            <div class="mcpr-divider-row flex items-center flex-wrap gap-x-6 gap-y-2 text-sm">
                 <label class="flex items-center gap-2">
                     { "interval (ms)" }
                     <input type="number" min="0"
-                        class="input input-bordered input-sm w-28 font-mono"
+                        class="input input-bordered input-sm w-28 font-mono mcpr-form-input"
                         value={(*interval_input).clone()}
                         oninput={on_interval} />
                 </label>
@@ -773,17 +773,20 @@ pub fn App() -> Html {
     });
 
     html! {
-        <div class="min-h-screen bg-base-200 p-6">
-            <div class="max-w-6xl mx-auto space-y-6">
-                <header class="flex items-center justify-between">
-                    <h1 class="text-2xl font-bold">{ "mcpr-ui" }</h1>
-                    <div class="flex items-center gap-3">
-                        <a class="link link-hover text-sm"
+        <div class="mcpr-shell">
+            <header class="mcpr-topbar">
+                <div class="mcpr-topbar-inner">
+                    <div class="mcpr-brand" aria-label="mcpr-ui">
+                        <span class="mcpr-logo-mark" aria-hidden="true"></span>
+                        <span>{ "mcpr-ui" }</span>
+                    </div>
+                    <nav class="mcpr-nav-actions" aria-label="Primary">
+                        <a class="mcpr-nav-link"
                             href="https://github.com/topi-banana/mcpr-editor"
                             target="_blank" rel="noreferrer">
-                            { "github" }
+                            { "GitHub" }
                         </a>
-                        <label class="swap swap-rotate btn btn-ghost btn-circle btn-sm"
+                        <label class="swap swap-rotate mcpr-icon-button"
                             title="ライト/ダークテーマ切り替え" aria-label="ライト/ダークテーマ切り替え">
                             <input type="checkbox"
                                 checked={*theme == Theme::Dark}
@@ -798,41 +801,59 @@ pub fn App() -> Html {
                                 <path d="M21.64,13a1,1,0,0,0-1.05-.14,8.05,8.05,0,0,1-3.37.73A8.15,8.15,0,0,1,9.08,5.49a8.59,8.59,0,0,1,.25-2A1,1,0,0,0,8,2.36,10.14,10.14,0,1,0,22,14.05,1,1,0,0,0,21.64,13Zm-9.5,6.69A8.14,8.14,0,0,1,7.08,5.22v.27A10.15,10.15,0,0,0,17.22,15.63a9.79,9.79,0,0,0,2.1-.22A8.11,8.11,0,0,1,12.14,19.73Z" />
                             </svg>
                         </label>
-                    </div>
-                </header>
+                    </nav>
+                </div>
+            </header>
 
-                <div class="card bg-base-100 shadow border-2 border-dashed border-base-300"
+            <main class="mcpr-page space-y-6">
+                <section class="mcpr-hero"
                     ondragover={on_dragover}
                     ondrop={on_drop_handler}>
-                    <div class="card-body items-center text-center gap-3">
-                        <p class="text-base-content/70">{ ".mcpr / Flashback (.zip) ファイルをドロップ (複数可)、または" }</p>
-                        <input type="file" accept=".mcpr,.zip" multiple=true
-                            class="file-input file-input-bordered w-full max-w-xs"
-                            onchange={on_input_change} />
+                    <div class="mcpr-hero-body">
+                        <div class="space-y-3">
+                            <p class="mcpr-eyebrow">{ "REPLAY WORKSPACE" }</p>
+                            <h1 class="mcpr-hero-title">{ "Merge Minecraft replay archives." }</h1>
+                            <p class="mcpr-hero-copy">
+                                { "Drop .mcpr or Flashback .zip files, inspect the event stream, then export the merged archive." }
+                            </p>
+                        </div>
+                        <div class="mcpr-dropzone">
+                            <div class="space-y-1">
+                                <p class="mcpr-eyebrow">{ "INPUT" }</p>
+                                <p class="text-sm text-base-content/70">
+                                    { ".mcpr / Flashback (.zip) ファイルをドロップ (複数可)、またはファイルを選択" }
+                                </p>
+                            </div>
+                            <input type="file" accept=".mcpr,.zip" multiple=true
+                                class="file-input file-input-bordered w-full mcpr-file-input"
+                                onchange={on_input_change} />
+                        </div>
                     </div>
-                </div>
+                </section>
 
                 if !files.entries.is_empty() {
-                    <div class="card bg-base-100 shadow">
-                        <div class="card-body gap-3">
-                            <h2 class="card-title">
+                    <section class="mcpr-panel">
+                        <div class="mcpr-panel-body">
+                            <div class="mcpr-section-header">
+                                <h2 class="mcpr-section-title">
                                 { "Files" }
-                                <span class="badge badge-ghost">{ files.entries.len() }</span>
-                            </h2>
-                            <ul class="space-y-2">{ file_rows }</ul>
+                                    <span class="mcpr-badge">{ files.entries.len() }</span>
+                                </h2>
+                            </div>
+                            <ul class="mcpr-file-list">{ file_rows }</ul>
                             { merge_settings }
                             { export_row }
                             if let Some(msg) = export_error.as_ref() {
-                                <div class="alert alert-error text-sm py-2">{ msg }</div>
+                                <div class="alert text-sm py-2 mcpr-alert">{ msg }</div>
                             }
                         </div>
-                    </div>
+                    </section>
                 }
 
                 if let Some(data) = merged.as_ref() {
                     <LoadedView data={data.clone()} />
                 }
-            </div>
+            </main>
         </div>
     }
 }
@@ -945,7 +966,7 @@ fn LoadedView(props: &LoadedViewProps) -> Html {
         html! {
             <th class={classes!("cursor-pointer", "select-none", width)} {onclick}>
                 { label }
-                <span class="text-primary inline-block w-3 ml-0.5">{ indicator }</span>
+                <span class="inline-block w-3 ml-0.5 text-primary">{ indicator }</span>
             </th>
         }
     };
@@ -980,8 +1001,9 @@ fn LoadedView(props: &LoadedViewProps) -> Html {
                 Callback::from(move |_| apply_filter.emit(filter.with_toggled(cat)))
             };
             html! {
-                <button class={classes!("btn", "btn-xs",
-                        if active { "btn-primary" } else { "btn-ghost opacity-60" })}
+                <button class={classes!(
+                        "btn", "btn-xs", "mcpr-btn",
+                        if active { "mcpr-btn-primary" } else { "mcpr-btn-secondary opacity-70" })}
                     {onclick}>
                     { cat.label() }
                 </button>
@@ -1005,12 +1027,12 @@ fn LoadedView(props: &LoadedViewProps) -> Html {
             let (event, state) = match &row.kind {
                 RowKind::Packet { id, state } => (
                     html! { <code>{ format!("0x{id:02x}") }</code> },
-                    html! { <span class="badge badge-ghost badge-sm">{ state_name(*state) }</span> },
+                    html! { <span class="mcpr-badge">{ state_name(*state) }</span> },
                 ),
                 RowKind::Custom { name } => (
                     // truncate されても hover (title) で全名を確認できる
                     html! { <code title={name.clone()}>{ name.clone() }</code> },
-                    html! { <span class="text-base-content/40">{ "—" }</span> },
+                    html! { <span class="mcpr-muted">{ "—" }</span> },
                 ),
             };
             html! {
@@ -1027,10 +1049,12 @@ fn LoadedView(props: &LoadedViewProps) -> Html {
 
     html! {
         <>
-            <div class="card bg-base-100 shadow">
-                <div class="card-body">
-                    <h2 class="card-title">{ "Metadata" }</h2>
-                    <div class="grid grid-cols-1 sm:grid-cols-2 gap-y-1 gap-x-6 text-sm">
+            <section class="mcpr-panel">
+                <div class="mcpr-panel-body">
+                    <div class="mcpr-section-header">
+                        <h2 class="mcpr-section-title">{ "Metadata" }</h2>
+                    </div>
+                    <div class="mcpr-meta-grid">
                         <MetaRow label="File" value={props.data.filename.clone()} />
                         <MetaRow label="format" value={props.data.format.to_string()} />
                         <MetaRow label="mcversion" value={props.data.info.mc_version.clone()} />
@@ -1043,14 +1067,14 @@ fn LoadedView(props: &LoadedViewProps) -> Html {
                         <MetaRow label="events" value={total_all.to_string()} />
                     </div>
                 </div>
-            </div>
+            </section>
 
-            <div class="card bg-base-100 shadow">
-                <div class="card-body">
-                    <div class="flex items-center justify-between flex-wrap gap-2">
-                        <h2 class="card-title">
+            <section class="mcpr-panel">
+                <div class="mcpr-panel-body">
+                    <div class="mcpr-section-header">
+                        <h2 class="mcpr-section-title">
                             { "Events" }
-                            <span class="badge badge-ghost">
+                            <span class="mcpr-badge">
                                 { if shown == total_all {
                                     total_all.to_string()
                                 } else {
@@ -1059,25 +1083,25 @@ fn LoadedView(props: &LoadedViewProps) -> Html {
                             </span>
                         </h2>
                         <div class="join">
-                            <button class="btn btn-sm join-item" onclick={prev}
+                            <button class="btn btn-sm join-item mcpr-btn mcpr-btn-secondary" onclick={prev}
                                 disabled={cur_page == 0}>{ "Prev" }</button>
-                            <button class="btn btn-sm join-item no-animation pointer-events-none">
+                            <button class="btn btn-sm join-item no-animation pointer-events-none mcpr-btn mcpr-btn-secondary">
                                 { format!("{} / {}", cur_page + 1, total_pages) }
                             </button>
-                            <button class="btn btn-sm join-item" onclick={next}
+                            <button class="btn btn-sm join-item mcpr-btn mcpr-btn-secondary" onclick={next}
                                 disabled={cur_page + 1 >= total_pages}>{ "Next" }</button>
                         </div>
                     </div>
                     <div class="flex items-center flex-wrap gap-1">
                         { category_buttons }
                         <input type="text"
-                            class="input input-bordered input-sm font-mono w-64 ml-auto"
+                            class="input input-bordered input-sm font-mono w-full sm:w-64 sm:ml-auto mcpr-form-input"
                             placeholder="filter: 0x2c / move_entities"
                             value={filter.query.clone()}
                             oninput={on_query} />
                     </div>
-                    <div class="overflow-x-auto">
-                        <table class="table table-zebra table-sm table-fixed min-w-[42rem]">
+                    <div class="mcpr-table-wrap">
+                        <table class="mcpr-table">
                             <thead>
                                 <tr>
                                     { sortable_th("#", SortKey::Index, Some("w-24")) }
@@ -1091,7 +1115,7 @@ fn LoadedView(props: &LoadedViewProps) -> Html {
                         </table>
                     </div>
                 </div>
-            </div>
+            </section>
         </>
     }
 }
@@ -1105,9 +1129,9 @@ struct MetaRowProps {
 #[function_component]
 fn MetaRow(props: &MetaRowProps) -> Html {
     html! {
-        <div>
-            <span class="font-semibold text-base-content/70 mr-2">{ props.label }{ ":" }</span>
-            <span class="font-mono">{ &props.value }</span>
+        <div class="mcpr-meta-row">
+            <span class="mcpr-meta-label">{ props.label }{ ":" }</span>
+            <span class="font-mono text-base-content truncate">{ &props.value }</span>
         </div>
     }
 }
