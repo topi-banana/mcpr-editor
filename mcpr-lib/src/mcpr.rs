@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::BTreeSet,
     io::{self, BufReader, BufWriter, Cursor, Read, Write},
 };
 
@@ -10,7 +10,7 @@ use crate::{
     event::{Event, EventSink, EventSource, ReplayInfo, State, Time},
     protocol::{
         Deserializer, FINISH_CONFIGURATION_PACKET_ID, LOGIN_SUCCESS_PACKET_ID, Serializer,
-        login_success_payload, varint_len,
+        checked_len_u32, login_success_payload, read_exact_vec, varint_len,
     },
 };
 
@@ -55,12 +55,14 @@ impl Packet {
             Ok(()) => {
                 let time = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
                 let length = u32::from_be_bytes([header[4], header[5], header[6], header[7]]);
-                let mut data = vec![0u8; length as usize];
-                reader.read_exact(&mut data)?;
-                let mut cur = Cursor::new(data);
-                let packet_id = cur.read_varint()?;
-                let mut packet_data = Vec::new();
-                cur.read_to_end(&mut packet_data)?;
+                let mut data =
+                    read_exact_vec(reader, checked_len_u32(length, "packet length")?, "packet")?;
+                let (packet_id, body_start) = {
+                    let mut cur = Cursor::new(data.as_slice());
+                    let packet_id = cur.read_varint()?;
+                    (packet_id, cur.position() as usize)
+                };
+                let packet_data = data.split_off(body_start);
                 Ok(Some(Packet::new(
                     time,
                     packet_id,
@@ -95,7 +97,7 @@ pub struct MetaData {
     pub protocol: u32,
     pub generator: String,
     pub selfId: i32,
-    pub players: HashSet<uuid::Uuid>,
+    pub players: BTreeSet<uuid::Uuid>,
 }
 
 impl Default for MetaData {
@@ -112,7 +114,7 @@ impl Default for MetaData {
             protocol: 0,
             generator: String::new(),
             selfId: -1,
-            players: HashSet::new(),
+            players: BTreeSet::new(),
         }
     }
 }
@@ -444,6 +446,17 @@ mod tests {
         assert!(source.next_event().is_err());
     }
 
+    #[test]
+    fn packet_reader_rejects_absurd_length_without_allocating() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        buf.extend_from_slice(&(268_435_457u32).to_be_bytes());
+
+        let err = Packet::read_from(&mut Cursor::new(buf)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("packet"));
+    }
+
     use crate::archive::testing::MemArchive;
 
     fn packet_event(time_ms: u64, state: State, id: i32, data: &[u8]) -> Event {
@@ -549,7 +562,7 @@ mod tests {
             protocol_version: 774,
             duration_ms: 6150,
             data_version: Some(4671),
-            players: HashSet::new(),
+            players: BTreeSet::new(),
         };
         sink.finish(&info).unwrap();
         let archive = sink.into_archive();

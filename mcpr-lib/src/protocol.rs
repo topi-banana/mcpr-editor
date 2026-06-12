@@ -1,5 +1,63 @@
-use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use std::io;
+
+use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
+
+const MAX_ALLOC_BYTES: usize = 256 * 1024 * 1024;
+
+pub(crate) fn invalid_data(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message.into())
+}
+
+pub(crate) fn checked_len_i32(value: i32, field: &str) -> io::Result<usize> {
+    usize::try_from(value).map_err(|_| invalid_data(format!("{field} cannot be negative: {value}")))
+}
+
+pub(crate) fn checked_len_u32(value: u32, field: &str) -> io::Result<usize> {
+    usize::try_from(value).map_err(|_| invalid_data(format!("{field} is too large: {value}")))
+}
+
+fn ensure_alloc_len(len: usize, field: &str) -> io::Result<()> {
+    if len > isize::MAX as usize {
+        return Err(invalid_data(format!("{field} is too large: {len} bytes")));
+    }
+    if len > MAX_ALLOC_BYTES {
+        return Err(invalid_data(format!(
+            "{field} is too large: {len} bytes (limit: {MAX_ALLOC_BYTES})"
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn read_exact_vec<R: io::Read + ?Sized>(
+    reader: &mut R,
+    len: usize,
+    field: &str,
+) -> io::Result<Vec<u8>> {
+    ensure_alloc_len(len, field)?;
+    let mut buffer = Vec::new();
+    buffer
+        .try_reserve_exact(len)
+        .map_err(|_| invalid_data(format!("{field} is too large: {len} bytes")))?;
+    buffer.resize(len, 0);
+    reader.read_exact(&mut buffer)?;
+    Ok(buffer)
+}
+
+pub(crate) fn read_exact_vec_from_cursor(
+    cursor: &mut io::Cursor<&[u8]>,
+    len: usize,
+    field: &str,
+) -> io::Result<Vec<u8>> {
+    let position = cursor.position() as usize;
+    let remaining = cursor.get_ref().len().saturating_sub(position);
+    if len > remaining {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!("{field} length {len} exceeds remaining {remaining} bytes"),
+        ));
+    }
+    read_exact_vec(cursor, len, field)
+}
 
 pub trait Deserializer: io::Read {
     fn read_bool(&mut self) -> io::Result<bool> {
@@ -30,12 +88,11 @@ pub trait Deserializer: io::Read {
         self.read_f64::<BigEndian>()
     }
     fn read_string(&mut self) -> io::Result<String> {
-        let length = self.read_varint()? as usize;
-        let mut buffer = vec![0u8; length];
-        self.read_exact(&mut buffer)?;
+        let length = checked_len_i32(self.read_varint()?, "string length")?;
+        let buffer = read_exact_vec(self, length, "string")?;
 
         let s = String::from_utf8(buffer)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid UTF-8 string"))?
+            .map_err(|_| invalid_data("Invalid UTF-8 string"))?
             .to_string();
         Ok(s)
     }

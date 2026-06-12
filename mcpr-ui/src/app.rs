@@ -1,4 +1,4 @@
-use std::{cmp::Ordering, io::Cursor, rc::Rc};
+use std::{cmp::Ordering, collections::HashMap, io::Cursor, rc::Rc};
 
 use gloo_file::{
     File as GlooFile,
@@ -13,6 +13,14 @@ use mcpr_lib::{
 };
 use web_sys::{DragEvent, Event, HtmlInputElement};
 use yew::prelude::*;
+
+use crate::{
+    export::{
+        ExportFormat, ExportProgress, export_filename, export_merged, new_replay_uuid,
+        trigger_download,
+    },
+    merge::{MergeRule, merge_loaded},
+};
 
 const PAGE_SIZE: usize = 200;
 
@@ -90,7 +98,7 @@ pub struct EventRow {
 }
 
 /// フィルタ対象の行カテゴリ。パケットは state ごと、Custom は一括。
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Category {
     State(State),
     Custom,
@@ -240,13 +248,97 @@ pub struct Loaded {
     pub categories: Vec<Category>,
 }
 
-#[derive(Clone, PartialEq)]
-pub enum ViewState {
-    Idle,
-    Loading(String),
-    // Loaded は他 variant より大きいので Box で包む。
-    Loaded(Box<Loaded>),
+/// ファイル一覧の 1 エントリの読み込み状態。
+#[derive(Clone)]
+enum EntryState {
+    Loading,
+    /// パース後は不変。Rc は merge の use_memo 依存キー (ポインタ比較) も兼ねる。
+    /// `bytes` は元ファイルの生バイト列で、書き出し時の再パースに使う
+    /// (表示行 [`EventRow`] はパケット body を持たないため)。
+    Loaded {
+        loaded: Rc<Loaded>,
+        bytes: Rc<Vec<u8>>,
+    },
     Error(String),
+}
+
+/// アップロードされた 1 ファイル。`id` は発番順の安定キー
+/// (Yew の key と読み込み中 FileReader の管理に使う)。
+#[derive(Clone)]
+struct FileEntry {
+    id: u64,
+    filename: String,
+    state: EntryState,
+}
+
+/// アップロード済みファイルの順序付きリスト。
+/// 複数の読み込み完了が並行して届くため、クロージャに古い状態を
+/// キャプチャしない reducer ([`FilesAction`]) で更新する。
+#[derive(Default)]
+struct FilesState {
+    entries: Vec<FileEntry>,
+}
+
+enum FilesAction {
+    /// 読み込み開始 (Loading エントリを末尾へ追加)。
+    Add {
+        id: u64,
+        filename: String,
+    },
+    /// 読み込み・パース完了。完了前に削除されていたら no-op。
+    Finish {
+        id: u64,
+        result: Result<(Rc<Loaded>, Rc<Vec<u8>>), String>,
+    },
+    Remove {
+        id: u64,
+    },
+    MoveUp {
+        id: u64,
+    },
+    MoveDown {
+        id: u64,
+    },
+}
+
+impl Reducible for FilesState {
+    type Action = FilesAction;
+
+    fn reduce(self: Rc<Self>, action: FilesAction) -> Rc<Self> {
+        // FileEntry の clone は Rc + String のみで軽量。
+        let mut entries = self.entries.clone();
+        match action {
+            FilesAction::Add { id, filename } => entries.push(FileEntry {
+                id,
+                filename,
+                state: EntryState::Loading,
+            }),
+            FilesAction::Finish { id, result } => {
+                if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                    entry.state = match result {
+                        Ok((loaded, bytes)) => EntryState::Loaded { loaded, bytes },
+                        Err(msg) => EntryState::Error(msg),
+                    };
+                }
+            }
+            FilesAction::Remove { id } => entries.retain(|e| e.id != id),
+            FilesAction::MoveUp { id } => {
+                if let Some(i) = entries.iter().position(|e| e.id == id)
+                    && i > 0
+                {
+                    entries.swap(i - 1, i);
+                }
+            }
+            FilesAction::MoveDown { id } => {
+                if let Some(i) = entries.iter().position(|e| e.id == id)
+                    && i + 1 < entries.len()
+                {
+                    entries.swap(i, i + 1);
+                }
+            }
+        }
+        Rc::new(FilesState { entries })
+    }
 }
 
 fn state_name(s: State) -> &'static str {
@@ -259,12 +351,24 @@ fn state_name(s: State) -> &'static str {
     }
 }
 
+/// 行列中に出現するカテゴリを表示順 ([`Category::ORDER`]) で集計する。
+pub(crate) fn categories_of(rows: &[EventRow]) -> Vec<Category> {
+    let mut seen = 0u8;
+    for row in rows {
+        seen |= Category::of(&row.kind).bit();
+    }
+    Category::ORDER
+        .iter()
+        .copied()
+        .filter(|c| seen & c.bit() != 0)
+        .collect()
+}
+
 /// 論理イベント列を表示用の行へ読み出し、出現カテゴリも集計する。
 fn collect_events<S: EventSource>(
     mut source: S,
 ) -> anyhow::Result<(ReplayInfo, Vec<EventRow>, Vec<Category>)> {
     let info = source.info().clone();
-    let mut seen = 0u8;
     let rows = source
         .events()
         .map(|event| {
@@ -280,7 +384,6 @@ fn collect_events<S: EventSource>(
                         (time, RowKind::Custom { name }, data.len())
                     }
                 };
-                seen |= Category::of(&kind).bit();
                 EventRow {
                     time_ms: time.as_millis(),
                     kind,
@@ -289,15 +392,11 @@ fn collect_events<S: EventSource>(
             })
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
-    let categories = Category::ORDER
-        .iter()
-        .copied()
-        .filter(|c| seen & c.bit() != 0)
-        .collect();
+    let categories = categories_of(&rows);
     Ok((info, rows, categories))
 }
 
-fn parse_replay(filename: String, bytes: Vec<u8>) -> anyhow::Result<Loaded> {
+fn parse_replay(filename: String, bytes: &[u8]) -> anyhow::Result<Loaded> {
     let mut zip = ZipArchiveReader::new(Cursor::new(bytes))?;
     let format = detect_format(&mut zip)?;
     // McprEventSource は reader を借用するため、match の外で生かす
@@ -319,11 +418,38 @@ fn parse_replay(filename: String, bytes: Vec<u8>) -> anyhow::Result<Loaded> {
     })
 }
 
+fn file_list_to_vec(files: &web_sys::FileList) -> Vec<web_sys::File> {
+    (0..files.length()).filter_map(|i| files.get(i)).collect()
+}
+
+/// 書き出しの進行状態 (進捗バー表示用)。None = 書き出し中でない。
+#[derive(Clone, Copy, PartialEq)]
+enum ExportPhase {
+    /// zip 再パースなど、まだイベント処理件数を出せない開始直後。
+    Preparing,
+    /// イベント処理中。total はパース済み表示行数の合計
+    /// (export は同じソースを再パースするため一致する)。
+    Events { done: u64, total: u64 },
+    /// zip 圧縮・メタデータ書き込み中 (一括で走るため進捗は刻めない)。
+    Finishing,
+}
+
 #[function_component]
 pub fn App() -> Html {
-    let state = use_state(|| ViewState::Idle);
-    // 読み込み中の FileReader 保持用。借り換え時に古いものは drop される。
-    let reader_slot = use_mut_ref(|| Option::<FileReader>::None);
+    let files = use_reducer(FilesState::default);
+    // 読み込み中の FileReader を id 別に保持。remove で drop され読み込みは中断される。
+    let readers = use_mut_ref(HashMap::<u64, FileReader>::new);
+    // FileEntry::id の発番カウンタ。
+    let next_id = use_mut_ref(|| 0u64);
+
+    // 連結設定。interval は入力欄の原文を保持し、parse 失敗は 0 扱い。
+    let interval_input = use_state(String::new);
+    let rule = use_state(MergeRule::default);
+
+    // 書き出し設定と進行状態 (None = 書き出し中でない)。
+    let export_format = use_state(ExportFormat::default);
+    let export_phase = use_state(|| Option::<ExportPhase>::None);
+    let export_error = use_state(|| Option::<String>::None);
 
     let theme = use_state(initial_theme);
     use_effect_with(*theme, |t| apply_theme(*t));
@@ -333,54 +459,318 @@ pub fn App() -> Html {
         Callback::from(move |_: Event| theme.set(theme.toggled()))
     };
 
-    let on_file = {
-        let state = state.clone();
-        let reader_slot = reader_slot.clone();
-        Callback::from(move |file: web_sys::File| {
-            let filename = file.name();
-            state.set(ViewState::Loading(filename.clone()));
-            let state = state.clone();
-            let slot = reader_slot.clone();
-            let task = read_as_bytes(&GlooFile::from(file), move |result| {
-                *slot.borrow_mut() = None;
-                match result {
-                    Ok(bytes) => match parse_replay(filename, bytes) {
-                        Ok(loaded) => state.set(ViewState::Loaded(Box::new(loaded))),
-                        Err(e) => state.set(ViewState::Error(format!("parse error: {e}"))),
-                    },
-                    Err(e) => state.set(ViewState::Error(format!("read error: {e:?}"))),
-                }
-            });
-            *reader_slot.borrow_mut() = Some(task);
-        })
-    };
-
-    let on_input_change = {
-        let on_file = on_file.clone();
-        Callback::from(move |e: Event| {
-            let input: HtmlInputElement = e.target_unchecked_into();
-            if let Some(files) = input.files()
-                && let Some(file) = files.get(0)
-            {
-                on_file.emit(file);
+    let on_files = {
+        let dispatch = files.dispatcher();
+        let readers = readers.clone();
+        let next_id = next_id.clone();
+        Callback::from(move |list: Vec<web_sys::File>| {
+            for file in list {
+                let id = {
+                    let mut n = next_id.borrow_mut();
+                    *n += 1;
+                    *n
+                };
+                let filename = file.name();
+                dispatch.dispatch(FilesAction::Add {
+                    id,
+                    filename: filename.clone(),
+                });
+                let dispatch = dispatch.clone();
+                let readers_done = readers.clone();
+                let task = read_as_bytes(&GlooFile::from(file), move |result| {
+                    readers_done.borrow_mut().remove(&id);
+                    let result = match result {
+                        Ok(bytes) => {
+                            // 書き出し時の再パース用に生バイト列も保持する。
+                            let bytes = Rc::new(bytes);
+                            parse_replay(filename, &bytes)
+                                .map(|loaded| (Rc::new(loaded), bytes))
+                                .map_err(|e| format!("parse error: {e}"))
+                        }
+                        Err(e) => Err(format!("read error: {e:?}")),
+                    };
+                    dispatch.dispatch(FilesAction::Finish { id, result });
+                });
+                readers.borrow_mut().insert(id, task);
             }
         })
     };
 
+    let on_input_change = {
+        let on_files = on_files.clone();
+        Callback::from(move |e: Event| {
+            let input: HtmlInputElement = e.target_unchecked_into();
+            if let Some(files) = input.files() {
+                on_files.emit(file_list_to_vec(&files));
+            }
+            // 削除後に同じファイルを選び直しても change が発火するようにする。
+            input.set_value("");
+        })
+    };
+
     let on_drop_handler = {
-        let on_file = on_file.clone();
+        let on_files = on_files.clone();
         Callback::from(move |e: DragEvent| {
             e.prevent_default();
             if let Some(dt) = e.data_transfer()
                 && let Some(files) = dt.files()
-                && let Some(file) = files.get(0)
             {
-                on_file.emit(file);
+                on_files.emit(file_list_to_vec(&files));
             }
         })
     };
 
     let on_dragover = Callback::from(|e: DragEvent| e.prevent_default());
+
+    let interval_ms: u64 = interval_input.trim().parse().unwrap_or(0);
+
+    // 読み込み済みエントリの並び順 Rc 列。RcPtr のポインタ比較により、
+    // 追加・削除・順序・interval・ルールの変化時だけ merge が再計算される。
+    let loaded_inputs: Vec<RcPtr<Loaded>> = files
+        .entries
+        .iter()
+        .filter_map(|e| match &e.state {
+            EntryState::Loaded { loaded, .. } => Some(RcPtr(loaded.clone())),
+            _ => None,
+        })
+        .collect();
+    let merged = use_memo(
+        (loaded_inputs, interval_ms, *rule),
+        |(inputs, interval, rule)| {
+            let inputs: Vec<Rc<Loaded>> = inputs.iter().map(|p| p.0.clone()).collect();
+            merge_loaded(&inputs, *interval, *rule)
+        },
+    );
+
+    let last = files.entries.len().saturating_sub(1);
+    // 行ボタン用: id に対するアクションを dispatch する Callback を作る。
+    let row_action = {
+        let dispatch = files.dispatcher();
+        move |make: fn(u64) -> FilesAction, id: u64| {
+            let dispatch = dispatch.clone();
+            Callback::from(move |_| dispatch.dispatch(make(id)))
+        }
+    };
+    let file_rows = files
+        .entries
+        .iter()
+        .enumerate()
+        .map(|(i, entry)| {
+            let id = entry.id;
+            let up = row_action(|id| FilesAction::MoveUp { id }, id);
+            let down = row_action(|id| FilesAction::MoveDown { id }, id);
+            let remove = {
+                let dispatch = files.dispatcher();
+                let readers = readers.clone();
+                Callback::from(move |_| {
+                    // 読み込み中なら FileReader の drop で中断される。
+                    readers.borrow_mut().remove(&id);
+                    dispatch.dispatch(FilesAction::Remove { id });
+                })
+            };
+            let status = match &entry.state {
+                EntryState::Loading => html! {
+                    <span class="loading loading-spinner loading-xs"></span>
+                },
+                EntryState::Loaded { loaded: l, .. } => html! {
+                    <>
+                        <span class="badge badge-ghost badge-sm">{ l.format }</span>
+                        <span class="badge badge-ghost badge-sm">{ format!("{} ms", l.info.duration_ms) }</span>
+                        <span class="badge badge-ghost badge-sm">{ format!("{} events", l.events.len()) }</span>
+                    </>
+                },
+                EntryState::Error(msg) => html! {
+                    <span class="text-error text-sm truncate" title={msg.clone()}>{ msg }</span>
+                },
+            };
+            html! {
+                <li key={id.to_string()} class="flex items-center gap-2 rounded-lg bg-base-200 px-3 py-2">
+                    <span class="font-mono text-sm w-6 text-right text-base-content/50">{ i }</span>
+                    <span class="truncate font-mono" title={entry.filename.clone()}>{ &entry.filename }</span>
+                    { status }
+                    <div class="join ml-auto shrink-0">
+                        <button class="btn btn-xs join-item" title="上へ"
+                            disabled={i == 0} onclick={up}>{ "↑" }</button>
+                        <button class="btn btn-xs join-item" title="下へ"
+                            disabled={i == last} onclick={down}>{ "↓" }</button>
+                        <button class="btn btn-xs btn-error join-item" title="削除"
+                            onclick={remove}>{ "✕" }</button>
+                    </div>
+                </li>
+            }
+        })
+        .collect::<Html>();
+
+    let on_interval = {
+        let interval_input = interval_input.clone();
+        Callback::from(move |e: InputEvent| {
+            let input: HtmlInputElement = e.target_unchecked_into();
+            interval_input.set(input.value());
+        })
+    };
+    let on_toggle_rule = {
+        let rule = rule.clone();
+        Callback::from(move |_: Event| rule.set(rule.toggled()))
+    };
+
+    // Export は全エントリの読み込み完了時のみ許可する
+    // (Loading/Error 混在時に一部だけ暗黙に書き出されるのを防ぐ)。
+    let all_loaded = !files.entries.is_empty()
+        && files
+            .entries
+            .iter()
+            .all(|e| matches!(e.state, EntryState::Loaded { .. }));
+
+    let on_export = {
+        let files = files.clone();
+        let export_phase = export_phase.clone();
+        let export_error = export_error.clone();
+        let format = *export_format;
+        let rule = *rule;
+        Callback::from(move |_: MouseEvent| {
+            if export_phase.is_some() {
+                return;
+            }
+            let mut inputs: Vec<(String, Rc<Vec<u8>>)> = Vec::new();
+            let mut total = 0u64;
+            for entry in &files.entries {
+                match &entry.state {
+                    EntryState::Loaded { loaded, bytes } => {
+                        total += loaded.events.len() as u64;
+                        inputs.push((entry.filename.clone(), bytes.clone()));
+                    }
+                    // ボタンの disabled と同条件の保険 (全件 Loaded のときだけ)。
+                    _ => return,
+                }
+            }
+            if inputs.is_empty() {
+                return;
+            }
+            let filename = export_filename(&inputs[0].0, inputs.len() > 1, format);
+            export_phase.set(Some(ExportPhase::Preparing));
+            export_error.set(None);
+            let export_phase = export_phase.clone();
+            let export_error = export_error.clone();
+            // export_merged は一定イベント数ごとにブラウザへ yield するため、
+            // async タスクとして流せば書き出し中も進捗バーが再描画される。
+            yew::platform::spawn_local(async move {
+                let refs: Vec<&[u8]> = inputs.iter().map(|(_, b)| b.as_slice()).collect();
+                let on_progress = {
+                    let export_phase = export_phase.clone();
+                    move |progress| {
+                        export_phase.set(Some(match progress {
+                            ExportProgress::Events { processed } => ExportPhase::Events {
+                                done: processed,
+                                total,
+                            },
+                            ExportProgress::Finishing => ExportPhase::Finishing,
+                        }));
+                    }
+                };
+                let result = export_merged(
+                    &refs,
+                    interval_ms,
+                    rule,
+                    format,
+                    new_replay_uuid(),
+                    on_progress,
+                )
+                .await;
+                match result {
+                    Ok(bytes) => trigger_download(&bytes, &filename),
+                    Err(e) => export_error.set(Some(format!("export error: {e}"))),
+                }
+                export_phase.set(None);
+            });
+        })
+    };
+
+    let format_buttons = ExportFormat::ORDER
+        .iter()
+        .map(|&f| {
+            let export_format = export_format.clone();
+            let class = if *export_format == f {
+                "btn btn-sm join-item btn-primary"
+            } else {
+                "btn btn-sm join-item"
+            };
+            html! {
+                <button key={f.extension()} class={class}
+                    onclick={Callback::from(move |_| export_format.set(f))}>
+                    { f.label() }
+                </button>
+            }
+        })
+        .collect::<Html>();
+
+    // 進捗バー。イベント処理中は確定値、終端処理 (圧縮) 中は
+    // value 無しの不確定表示にする。
+    let progress_view = (*export_phase).map(|phase| {
+        let (value, label) = match phase {
+            ExportPhase::Preparing => (None, "準備中…".to_string()),
+            ExportPhase::Events { done, total } => {
+                let clamped = if total == 0 { 0 } else { done.min(total) };
+                let percent = clamped
+                    .saturating_mul(100)
+                    .checked_div(total)
+                    .unwrap_or(if done == 0 { 0 } else { 100 });
+                let label = if done > 0 && percent == 0 {
+                    "<1%".to_string()
+                } else {
+                    format!("{percent}%")
+                };
+                (Some(clamped.to_string()), label)
+            }
+            ExportPhase::Finishing => (None, "圧縮中…".to_string()),
+        };
+        let max = match phase {
+            ExportPhase::Preparing => "1".to_string(),
+            ExportPhase::Events { total, .. } => total.max(1).to_string(),
+            ExportPhase::Finishing => "1".to_string(),
+        };
+        html! {
+            <div class="flex items-center gap-2 grow min-w-40">
+                <progress class="progress progress-primary" value={value} max={max}></progress>
+                <span class="text-xs font-mono shrink-0 text-base-content/70 w-12 text-right">
+                    { label }
+                </span>
+            </div>
+        }
+    });
+
+    // 書き出し行。1 件でも意味がある (フォーマット変換 = CLI の単一入力動作)。
+    let export_row = html! {
+        <div class="flex items-center flex-wrap gap-3 pt-2 border-t border-base-300 text-sm">
+            <div class="join">{ format_buttons }</div>
+            { progress_view }
+            <button class="btn btn-primary btn-sm ml-auto"
+                disabled={!all_loaded || export_phase.is_some()}
+                onclick={on_export}>
+                { "Export" }
+            </button>
+        </div>
+    };
+
+    // 連結設定は 2 件以上で意味を持つときだけ出す。
+    let merge_settings = (files.entries.len() >= 2).then(|| {
+        html! {
+            <div class="flex items-center flex-wrap gap-x-6 gap-y-2 pt-2 border-t border-base-300 text-sm">
+                <label class="flex items-center gap-2">
+                    { "interval (ms)" }
+                    <input type="number" min="0"
+                        class="input input-bordered input-sm w-28 font-mono"
+                        value={(*interval_input).clone()}
+                        oninput={on_interval} />
+                </label>
+                <label class="flex items-center gap-2 cursor-pointer">
+                    <input type="checkbox" class="toggle toggle-sm toggle-primary"
+                        checked={*rule == MergeRule::CliCompatible}
+                        onchange={on_toggle_rule} />
+                    { "CLI互換フィルタ (2個目以降は Play のみ / Login(play) 0x2b 除外)" }
+                </label>
+            </div>
+        }
+    });
 
     html! {
         <div class="min-h-screen bg-base-200 p-6">
@@ -415,38 +805,49 @@ pub fn App() -> Html {
                     ondragover={on_dragover}
                     ondrop={on_drop_handler}>
                     <div class="card-body items-center text-center gap-3">
-                        <p class="text-base-content/70">{ ".mcpr / Flashback (.zip) ファイルをドロップ、または" }</p>
-                        <input type="file" accept=".mcpr,.zip"
+                        <p class="text-base-content/70">{ ".mcpr / Flashback (.zip) ファイルをドロップ (複数可)、または" }</p>
+                        <input type="file" accept=".mcpr,.zip" multiple=true
                             class="file-input file-input-bordered w-full max-w-xs"
                             onchange={on_input_change} />
                     </div>
                 </div>
 
-                { match &*state {
-                    ViewState::Idle => html!{},
-                    ViewState::Loading(name) => html! {
-                        <div class="alert">
-                            <span class="loading loading-spinner loading-sm"></span>
-                            <span>{ format!("{name} を読み込み中...") }</span>
+                if !files.entries.is_empty() {
+                    <div class="card bg-base-100 shadow">
+                        <div class="card-body gap-3">
+                            <h2 class="card-title">
+                                { "Files" }
+                                <span class="badge badge-ghost">{ files.entries.len() }</span>
+                            </h2>
+                            <ul class="space-y-2">{ file_rows }</ul>
+                            { merge_settings }
+                            { export_row }
+                            if let Some(msg) = export_error.as_ref() {
+                                <div class="alert alert-error text-sm py-2">{ msg }</div>
+                            }
                         </div>
-                    },
-                    ViewState::Error(msg) => html! {
-                        <div class="alert alert-error">
-                            <span>{ msg }</span>
-                        </div>
-                    },
-                    ViewState::Loaded(loaded) => html! {
-                        <LoadedView data={(**loaded).clone()} />
-                    },
-                } }
+                    </div>
+                }
+
+                if let Some(data) = merged.as_ref() {
+                    <LoadedView data={data.clone()} />
+                }
             </div>
         </div>
     }
 }
 
-#[derive(Properties, PartialEq)]
+#[derive(Properties)]
 struct LoadedViewProps {
-    data: Loaded,
+    data: Rc<Loaded>,
+}
+
+/// events の深い比較 (数百万行になり得る) を避け、merge 結果の
+/// ポインタ同一性だけで再描画を判定する。
+impl PartialEq for LoadedViewProps {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.data, &other.data)
+    }
 }
 
 /// use_memo の依存キー用に Rc をポインタ同一性で比較するラッパ。

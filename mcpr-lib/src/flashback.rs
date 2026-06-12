@@ -9,7 +9,9 @@ use serde::{Deserialize, Serialize};
 use crate::{
     archive::{ArchiveReader, ArchiveWriter},
     event::{Event, EventSink, EventSource, ReplayInfo, State, Time},
-    protocol::{Deserializer, Serializer},
+    protocol::{
+        Deserializer, Serializer, checked_len_i32, read_exact_vec, read_exact_vec_from_cursor,
+    },
 };
 
 /// level_chunk_caches の 1 ファイルあたり最大エントリ数。
@@ -143,6 +145,7 @@ pub const METADATA_FILE: &str = "metadata.json";
 
 /// flashback chunk ファイル先頭 i32 (big-endian)。
 pub const MAGIC_NUMBER: i32 = -679417724;
+const MAX_ACTION_REGISTRY_ENTRIES: usize = 1024;
 
 #[derive(Debug)]
 pub struct ChunkReader<R> {
@@ -157,18 +160,21 @@ impl<R: Read> ChunkReader<R> {
         if magic != MAGIC_NUMBER {
             anyhow::bail!("invalid flashback chunk magic: 0x{:08x}", magic);
         }
-        let action_count = reader.read_varint()? as usize;
+        let action_count = checked_len_i32(reader.read_varint()?, "action count")?;
+        if action_count > MAX_ACTION_REGISTRY_ENTRIES {
+            anyhow::bail!(
+                "action count is too large: {} (limit: {})",
+                action_count,
+                MAX_ACTION_REGISTRY_ENTRIES
+            );
+        }
         let mut actions = Vec::with_capacity(action_count);
         for _ in 0..action_count {
             let name = reader.read_string()?;
             actions.push(ActionKind::parse(&name));
         }
-        let snapshot_size = reader.read_int()?;
-        if snapshot_size < 0 {
-            anyhow::bail!("negative snapshot_size: {}", snapshot_size);
-        }
-        let mut snapshot = vec![0u8; snapshot_size as usize];
-        reader.read_exact(&mut snapshot)?;
+        let snapshot_size = checked_len_i32(reader.read_int()?, "snapshot_size")?;
+        let snapshot = read_exact_vec(&mut reader, snapshot_size, "snapshot")?;
         Ok(Self {
             actions: actions.into_boxed_slice(),
             snapshot: snapshot.into_boxed_slice(),
@@ -198,14 +204,11 @@ fn read_action_from<R: Read>(
         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(e) => return Err(e.into()),
     };
-    let length = reader.read_int()?;
-    if length < 0 {
-        anyhow::bail!("negative action length: {}", length);
-    }
-    let mut data = vec![0u8; length as usize];
-    reader.read_exact(&mut data)?;
+    let action_id = checked_len_i32(action_id, "action id")?;
+    let length = checked_len_i32(reader.read_int()?, "action length")?;
+    let data = read_exact_vec(reader, length, "action")?;
     let kind = actions
-        .get(action_id as usize)
+        .get(action_id)
         .ok_or_else(|| anyhow::anyhow!("action id {} out of registry range", action_id))?
         .clone();
     Ok(Some(Action::new(kind, data.into_boxed_slice())))
@@ -436,11 +439,8 @@ impl<R: ArchiveReader> FlashbackEventSource<R> {
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
                 Err(e) => return Err(e.into()),
             };
-            if size < 0 {
-                anyhow::bail!("negative entry size in level_chunk_cache: {}", size);
-            }
-            let mut data = vec![0u8; size as usize];
-            cursor.read_exact(&mut data)?;
+            let size = checked_len_i32(size, "level_chunk_cache entry size")?;
+            let data = read_exact_vec_from_cursor(&mut cursor, size, "level_chunk_cache entry")?;
             entries.push(split_packet_payload(&data)?);
         }
         Ok(entries)
@@ -760,6 +760,31 @@ mod tests {
         buf.extend_from_slice(&0i32.to_be_bytes());
         let err = ChunkReader::new(Cursor::new(&buf)).unwrap_err();
         assert!(err.to_string().contains("magic"));
+    }
+
+    #[test]
+    fn chunk_reader_rejects_negative_action_count_without_allocating() {
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(&MAGIC_NUMBER.to_be_bytes());
+        buf.extend_from_slice(&[0xff, 0xff, 0xff, 0xff, 0x0f]);
+
+        let err = ChunkReader::new(Cursor::new(&buf)).unwrap_err();
+        assert!(err.to_string().contains("action count"));
+    }
+
+    #[test]
+    fn chunk_reader_rejects_absurd_action_length_without_allocating() {
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let w = ChunkWriter::new(&mut buf, &[ActionKind::GamePacket], &[]).unwrap();
+            w.finish().unwrap();
+        }
+        buf.write_varint(0).unwrap();
+        buf.extend_from_slice(&(268_435_457i32).to_be_bytes());
+
+        let mut reader = ChunkReader::new(Cursor::new(&buf)).unwrap();
+        let err = reader.next_action().unwrap_err();
+        assert!(err.to_string().contains("action"));
     }
 
     #[test]
