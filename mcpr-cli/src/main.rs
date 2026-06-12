@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File},
     io::{BufReader, BufWriter},
     path::{Path, PathBuf},
@@ -12,10 +12,13 @@ use mcpr_lib::{
         directory::DirArchive,
         zip::{ZipArchiveReader, ZipArchiveWriter},
     },
-    event::{Event, EventSink, EventSource, ReplayFormat, ReplayInfo, State, Time, detect_format},
+    event::{
+        Event, EventSink, EventSource, ReplayFormat, ReplayInfo, State, Time, detect_format,
+        is_connection_init,
+    },
     flashback::{FlashbackEventSink, FlashbackReader},
     mcpr::{McprEventSink, ReplayReader},
-    protocol::{LOGIN_PLAY_PACKET_ID, parse_packet_id},
+    protocol::parse_packet_id,
 };
 
 macro_rules! chmax {
@@ -293,14 +296,8 @@ fn process<S: EventSource>(
                 }
             }
             // 2 個目以降の入力では接続初期化の重複を避ける
-            if !is_first_input {
-                if *state != State::Play {
-                    continue;
-                }
-                if *id == LOGIN_PLAY_PACKET_ID {
-                    // Login (play) packet の重複でクライアントが再 join しないように
-                    continue;
-                }
+            if !is_first_input && is_connection_init(*state, *id) {
+                continue;
             }
         }
 
@@ -334,7 +331,7 @@ fn main() -> anyhow::Result<()> {
 
     let mut stats = args.packet_details.then(Stats::default);
     let mut sink: Option<AnySink> = None;
-    let mut players = HashSet::new();
+    let mut players = BTreeSet::new();
     let mut merged_info: Option<ReplayInfo> = None;
     let mut offset_ms = 0u64;
 

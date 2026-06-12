@@ -1,4 +1,10 @@
 [target.wasm32-unknown-unknown]
 # getrandom 0.3 は wasm32-unknown-unknown で wasm_js backend を明示する必要がある。
 # mcpr-ui の wasm ビルド用。mcpr-cli はこの target を使わないので影響しない。
-rustflags = ['--cfg', 'getrandom_backend="wasm_js"']
+# wasm32 の線形メモリ上限を最大値の 4GiB (65536 pages) にする。
+rustflags = [
+    '--cfg',
+    'getrandom_backend="wasm_js"',
+    '-C',
+    'link-arg=--max-memory=4294967296',
+]

@@ -9,7 +9,7 @@
 //! `LevelChunkCached` のチャンク外部化など）は各アダプタが吸収し、
 //! この層には現れない。
 
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 
 use crate::{
     archive::ArchiveReader,
@@ -75,6 +75,16 @@ impl State {
     }
 }
 
+/// 複数リプレイ連結時、2 個目以降の入力から除外すべき接続初期化
+/// イベントか (mcpr-cli / mcpr-ui 共通の連結規則)。
+///
+/// Play 以外の全パケット (Login/Configuration の初期化シーケンス) と、
+/// クライアントを再 join させてしまう Login (play) パケット
+/// ([`crate::protocol::LOGIN_PLAY_PACKET_ID`]) が該当する。
+pub fn is_connection_init(state: State, id: i32) -> bool {
+    state != State::Play || id == crate::protocol::LOGIN_PLAY_PACKET_ID
+}
+
 /// フォーマット非依存の論理イベント。
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
@@ -121,7 +131,7 @@ pub struct ReplayInfo {
     /// Flashback 由来の場合のみ判明する (mcpr メタデータには存在しない)。
     pub data_version: Option<u32>,
     /// mcpr 由来の場合のみ判明する。
-    pub players: HashSet<uuid::Uuid>,
+    pub players: BTreeSet<uuid::Uuid>,
 }
 
 impl From<&crate::mcpr::MetaData> for ReplayInfo {
@@ -143,7 +153,7 @@ impl From<&crate::flashback::MetaData> for ReplayInfo {
             protocol_version: m.protocol_version,
             duration_ms: Time::from_ticks(m.total_ticks).as_millis(),
             data_version: Some(m.data_version),
-            players: HashSet::new(),
+            players: BTreeSet::new(),
         }
     }
 }
@@ -244,5 +254,17 @@ mod tests {
         assert_eq!(State::Configuration.advance(0x02), State::Configuration);
         assert_eq!(State::Play.advance(0x02), State::Play);
         assert_eq!(State::Play.advance(0x03), State::Play);
+    }
+
+    #[test]
+    fn connection_init_predicate() {
+        use crate::protocol::LOGIN_PLAY_PACKET_ID;
+        // Play の通常パケットだけが連結 2 個目以降でも残る
+        assert!(!is_connection_init(State::Play, 0x2c));
+        assert!(is_connection_init(State::Play, LOGIN_PLAY_PACKET_ID));
+        assert!(is_connection_init(State::Login, 0x02));
+        assert!(is_connection_init(State::Configuration, 0x2c));
+        assert!(is_connection_init(State::Handshaking, 0x00));
+        assert!(is_connection_init(State::Status, 0x00));
     }
 }

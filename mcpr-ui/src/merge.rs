@@ -1,12 +1,9 @@
 //! 複数リプレイの連結。mcpr-cli の連結仕様 (時刻オフセット + 2 個目以降の
 //! 接続初期化パケット除外) をパース済みの表示行に対して再現する。
 
-use std::{collections::HashSet, rc::Rc};
+use std::{collections::BTreeSet, rc::Rc};
 
-use mcpr_lib::{
-    event::{ReplayInfo, State},
-    protocol::LOGIN_PLAY_PACKET_ID,
-};
+use mcpr_lib::event::{ReplayInfo, is_connection_init};
 
 use crate::app::{EventRow, Loaded, RowKind, categories_of};
 
@@ -14,7 +11,7 @@ use crate::app::{EventRow, Loaded, RowKind, categories_of};
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub enum MergeRule {
     /// mcpr-cli 互換: 2 個目以降は Play パケットのみ残し、Login (play) パケット
-    /// ([`LOGIN_PLAY_PACKET_ID`]) も除外する。Custom 行はフィルタ対象外
+    /// も除外する ([`is_connection_init`])。Custom 行はフィルタ対象外
     /// (CLI のフィルタは Packet にのみ掛かる)。
     #[default]
     CliCompatible,
@@ -48,7 +45,7 @@ pub fn merge_loaded(
 
 fn merge_many(inputs: &[Rc<Loaded>], interval_ms: u64, rule: MergeRule) -> Loaded {
     let mut rows = Vec::with_capacity(inputs.iter().map(|l| l.events.len()).sum());
-    let mut players = HashSet::new();
+    let mut players = BTreeSet::new();
     let mut offset_ms = 0u64;
     for (index, loaded) in inputs.iter().enumerate() {
         for row in loaded.events.iter() {
@@ -56,7 +53,7 @@ fn merge_many(inputs: &[Rc<Loaded>], interval_ms: u64, rule: MergeRule) -> Loade
             if rule == MergeRule::CliCompatible
                 && index > 0
                 && let RowKind::Packet { id, state } = &row.kind
-                && (*state != State::Play || *id == LOGIN_PLAY_PACKET_ID)
+                && is_connection_init(*state, *id)
             {
                 continue;
             }
@@ -96,6 +93,7 @@ fn merge_many(inputs: &[Rc<Loaded>], interval_ms: u64, rule: MergeRule) -> Loade
 mod tests {
     use super::*;
     use crate::app::Category;
+    use mcpr_lib::{event::State, protocol::LOGIN_PLAY_PACKET_ID};
 
     fn packet(time_ms: u64, id: i32, state: State) -> EventRow {
         EventRow {
@@ -254,8 +252,10 @@ mod tests {
         // duration = Σduration + (N-1) * interval
         assert_eq!(merged.info.duration_ms, 500 + 1000 + 300);
         // players は union
-        let expect: std::collections::HashSet<_> =
-            [1u128, 2, 3].iter().map(|&n| uuid::Uuid::from_u128(n)).collect();
+        let expect: std::collections::BTreeSet<_> = [1u128, 2, 3]
+            .iter()
+            .map(|&n| uuid::Uuid::from_u128(n))
+            .collect();
         assert_eq!(merged.info.players, expect);
         // バージョン情報は先頭から継承
         assert_eq!(merged.info.mc_version, "1.21.11");
@@ -285,12 +285,7 @@ mod tests {
     fn mixed_formats_reported() {
         let a = loaded_with("a.mcpr", "ReplayMod", 100, vec![], &[]);
         let b = loaded_with("b.zip", "Flashback", 100, vec![], &[]);
-        let same = merge_loaded(
-            &[a.clone(), a.clone()],
-            0,
-            MergeRule::CliCompatible,
-        )
-        .unwrap();
+        let same = merge_loaded(&[a.clone(), a.clone()], 0, MergeRule::CliCompatible).unwrap();
         assert_eq!(same.format, "ReplayMod");
         let mixed = merge_loaded(&[a, b], 0, MergeRule::CliCompatible).unwrap();
         assert_eq!(mixed.format, "mixed");
