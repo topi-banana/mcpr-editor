@@ -710,11 +710,10 @@ pub fn App() -> Html {
             ExportPhase::Preparing => (None, "準備中…".to_string()),
             ExportPhase::Events { done, total } => {
                 let clamped = if total == 0 { 0 } else { done.min(total) };
-                let percent = if total == 0 {
-                    if done == 0 { 0 } else { 100 }
-                } else {
-                    clamped.saturating_mul(100) / total
-                };
+                let percent = clamped
+                    .saturating_mul(100)
+                    .checked_div(total)
+                    .unwrap_or(if done == 0 { 0 } else { 100 });
                 let label = if done > 0 && percent == 0 {
                     "<1%".to_string()
                 } else {
