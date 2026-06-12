@@ -1,10 +1,13 @@
 //! 複数リプレイの連結。mcpr-cli の連結仕様 (時刻オフセット + 2 個目以降の
 //! 接続初期化パケット除外) をパース済みの表示行に対して再現する。
 
+#[cfg(test)]
 use std::{collections::BTreeSet, rc::Rc};
 
+#[cfg(test)]
 use mcpr_lib::event::{ReplayInfo, is_connection_init};
 
+#[cfg(test)]
 use crate::app::{EventRow, Loaded, RowKind, categories_of};
 
 /// 連結時の行フィルタルール。
@@ -31,11 +34,8 @@ impl MergeRule {
 /// 読み込み済みリプレイを並び順で連結する。
 /// 空入力は None、単一入力は入力 Rc をそのまま返す (従来の単一ファイル表示と
 /// 完全に一致し、ポインタが安定するので下流の memo も再計算されない)。
-pub fn merge_loaded(
-    inputs: &[Rc<Loaded>],
-    interval_ms: u64,
-    rule: MergeRule,
-) -> Option<Rc<Loaded>> {
+#[cfg(test)]
+fn merge_loaded(inputs: &[Rc<Loaded>], interval_ms: u64, rule: MergeRule) -> Option<Rc<Loaded>> {
     match inputs {
         [] => None,
         [single] => Some(single.clone()),
@@ -43,6 +43,7 @@ pub fn merge_loaded(
     }
 }
 
+#[cfg(test)]
 fn merge_many(inputs: &[Rc<Loaded>], interval_ms: u64, rule: MergeRule) -> Loaded {
     let mut rows = Vec::with_capacity(inputs.iter().map(|l| l.events.len()).sum());
     let mut players = BTreeSet::new();

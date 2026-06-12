@@ -344,6 +344,29 @@
     gap: 8px;
   }
 
+  .mcpr-workspace {
+    display: grid;
+    grid-template-columns: minmax(320px, 380px) minmax(0, 1fr);
+    gap: 16px;
+    align-items: start;
+  }
+
+  .mcpr-workspace-sidebar {
+    position: sticky;
+    top: 80px;
+    min-width: 0;
+  }
+
+  .mcpr-workspace-main {
+    display: grid;
+    min-width: 0;
+    gap: 16px;
+  }
+
+  .mcpr-files-panel .mcpr-panel-body {
+    gap: 12px;
+  }
+
   .mcpr-file-row {
     display: grid;
     grid-template-columns: 32px minmax(0, 1fr) auto auto;
@@ -353,6 +376,57 @@
     border-radius: 8px;
     background: var(--mcpr-canvas-soft);
     padding: 8px 12px;
+  }
+
+  .mcpr-file-tab-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 8px;
+    align-items: stretch;
+    min-width: 0;
+  }
+
+  .mcpr-file-tab {
+    display: grid;
+    grid-template-columns: 28px minmax(0, 1fr);
+    gap: 4px 10px;
+    align-items: center;
+    min-width: 0;
+    min-height: 58px;
+    border: 1px solid var(--mcpr-hairline);
+    border-radius: 8px;
+    background: var(--mcpr-canvas-soft);
+    padding: 8px 10px;
+    text-align: left;
+  }
+
+  .mcpr-file-tab:hover:not(:disabled) {
+    border-color: var(--mcpr-hairline-strong);
+    background: var(--mcpr-canvas);
+  }
+
+  .mcpr-file-tab:focus-visible {
+    outline: 2px solid var(--mcpr-link);
+    outline-offset: 2px;
+  }
+
+  .mcpr-file-tab:disabled {
+    cursor: default;
+  }
+
+  .mcpr-file-tab-row.is-active .mcpr-file-tab {
+    border-color: var(--mcpr-ink);
+    background: var(--mcpr-canvas);
+    box-shadow: inset 3px 0 0 var(--mcpr-ink);
+  }
+
+  .mcpr-file-tab .mcpr-file-status {
+    grid-column: 2;
+  }
+
+  .mcpr-file-actions {
+    align-self: center;
+    justify-self: end;
   }
 
   .mcpr-row-index {
@@ -435,6 +509,30 @@
     padding-top: 16px;
   }
 
+  .mcpr-merge-settings,
+  .mcpr-export-row {
+    display: grid;
+    gap: 12px;
+  }
+
+  .mcpr-field-row,
+  .mcpr-toggle-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    color: var(--mcpr-body);
+  }
+
+  .mcpr-field-row {
+    justify-content: space-between;
+  }
+
+  .mcpr-toggle-row {
+    align-items: flex-start;
+    cursor: pointer;
+    line-height: 20px;
+  }
+
   .mcpr-form-input {
     min-height: 32px;
     border-color: var(--mcpr-hairline);
@@ -471,6 +569,12 @@
     border-radius: 8px;
     background: var(--mcpr-error-soft);
     color: var(--mcpr-error);
+  }
+
+  .mcpr-empty-copy {
+    color: var(--mcpr-body);
+    font-size: 14px;
+    line-height: 22px;
   }
 
   .mcpr-meta-grid {
@@ -587,5 +691,15 @@
 
   .mcpr-meta-grid {
     grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 960px) {
+  .mcpr-workspace {
+    grid-template-columns: 1fr;
+  }
+
+  .mcpr-workspace-sidebar {
+    position: static;
   }
 }

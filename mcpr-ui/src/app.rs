@@ -19,7 +19,7 @@ use crate::{
         ExportFormat, ExportProgress, export_filename, export_merged, new_replay_uuid,
         trigger_download,
     },
-    merge::{MergeRule, merge_loaded},
+    merge::MergeRule,
 };
 
 const PAGE_SIZE: usize = 200;
@@ -437,6 +437,7 @@ enum ExportPhase {
 #[function_component]
 pub fn App() -> Html {
     let files = use_reducer(FilesState::default);
+    let selected_file_id = use_state(|| Option::<u64>::None);
     // 読み込み中の FileReader を id 別に保持。remove で drop され読み込みは中断される。
     let readers = use_mut_ref(HashMap::<u64, FileReader>::new);
     // FileEntry::id の発番カウンタ。
@@ -524,23 +525,22 @@ pub fn App() -> Html {
 
     let interval_ms: u64 = interval_input.trim().parse().unwrap_or(0);
 
-    // 読み込み済みエントリの並び順 Rc 列。RcPtr のポインタ比較により、
-    // 追加・削除・順序・interval・ルールの変化時だけ merge が再計算される。
-    let loaded_inputs: Vec<RcPtr<Loaded>> = files
-        .entries
-        .iter()
-        .filter_map(|e| match &e.state {
-            EntryState::Loaded { loaded, .. } => Some(RcPtr(loaded.clone())),
-            _ => None,
+    let selected_file = (*selected_file_id)
+        .and_then(|selected_id| {
+            files.entries.iter().find_map(|entry| match &entry.state {
+                EntryState::Loaded { loaded, .. } if entry.id == selected_id => {
+                    Some((entry.id, loaded.clone()))
+                }
+                _ => None,
+            })
         })
-        .collect();
-    let merged = use_memo(
-        (loaded_inputs, interval_ms, *rule),
-        |(inputs, interval, rule)| {
-            let inputs: Vec<Rc<Loaded>> = inputs.iter().map(|p| p.0.clone()).collect();
-            merge_loaded(&inputs, *interval, *rule)
-        },
-    );
+        .or_else(|| {
+            files.entries.iter().find_map(|entry| match &entry.state {
+                EntryState::Loaded { loaded, .. } => Some((entry.id, loaded.clone())),
+                _ => None,
+            })
+        });
+    let active_file_id = selected_file.as_ref().map(|(id, _)| *id);
 
     let last = files.entries.len().saturating_sub(1);
     // 行ボタン用: id に対するアクションを dispatch する Callback を作る。
@@ -557,6 +557,16 @@ pub fn App() -> Html {
         .enumerate()
         .map(|(i, entry)| {
             let id = entry.id;
+            let is_loaded = matches!(entry.state, EntryState::Loaded { .. });
+            let is_active = active_file_id == Some(id);
+            let select = {
+                let selected_file_id = selected_file_id.clone();
+                Callback::from(move |_| {
+                    if is_loaded {
+                        selected_file_id.set(Some(id));
+                    }
+                })
+            };
             let up = row_action(|id| FilesAction::MoveUp { id }, id);
             let down = row_action(|id| FilesAction::MoveDown { id }, id);
             let remove = {
@@ -584,11 +594,15 @@ pub fn App() -> Html {
                 },
             };
             html! {
-                <li key={id.to_string()} class="mcpr-file-row">
-                    <span class="mcpr-row-index">{ i }</span>
-                    <span class="mcpr-filename" title={entry.filename.clone()}>{ &entry.filename }</span>
-                    <div class="mcpr-file-status">{ status }</div>
-                    <div class="join shrink-0 justify-self-end">
+                <li key={id.to_string()} class={classes!("mcpr-file-tab-row", is_active.then_some("is-active"))}>
+                    <button type="button" class="mcpr-file-tab"
+                        disabled={!is_loaded}
+                        onclick={select}>
+                        <span class="mcpr-row-index">{ i }</span>
+                        <span class="mcpr-filename" title={entry.filename.clone()}>{ &entry.filename }</span>
+                        <span class="mcpr-file-status">{ status }</span>
+                    </button>
+                    <div class="join mcpr-file-actions">
                         <button class="btn btn-xs join-item mcpr-btn mcpr-btn-secondary" title="上へ"
                             disabled={i == 0} onclick={up}>{ "↑" }</button>
                         <button class="btn btn-xs join-item mcpr-btn mcpr-btn-secondary" title="下へ"
@@ -740,10 +754,10 @@ pub fn App() -> Html {
 
     // 書き出し行。1 件でも意味がある (フォーマット変換 = CLI の単一入力動作)。
     let export_row = html! {
-        <div class="mcpr-divider-row flex items-center flex-wrap gap-3 text-sm">
+        <div class="mcpr-divider-row mcpr-export-row text-sm">
             <div class="join">{ format_buttons }</div>
             { progress_view }
-            <button class="btn btn-sm ml-auto mcpr-btn mcpr-btn-primary"
+            <button class="btn btn-sm mcpr-btn mcpr-btn-primary"
                 disabled={!all_loaded || export_phase.is_some()}
                 onclick={on_export}>
                 { "Export" }
@@ -754,15 +768,15 @@ pub fn App() -> Html {
     // 連結設定は 2 件以上で意味を持つときだけ出す。
     let merge_settings = (files.entries.len() >= 2).then(|| {
         html! {
-            <div class="mcpr-divider-row flex items-center flex-wrap gap-x-6 gap-y-2 text-sm">
-                <label class="flex items-center gap-2">
+            <div class="mcpr-divider-row mcpr-merge-settings text-sm">
+                <label class="mcpr-field-row">
                     { "interval (ms)" }
                     <input type="number" min="0"
                         class="input input-bordered input-sm w-28 font-mono mcpr-form-input"
                         value={(*interval_input).clone()}
                         oninput={on_interval} />
                 </label>
-                <label class="flex items-center gap-2 cursor-pointer">
+                <label class="mcpr-toggle-row">
                     <input type="checkbox" class="toggle toggle-sm toggle-primary"
                         checked={*rule == MergeRule::CliCompatible}
                         onchange={on_toggle_rule} />
@@ -832,26 +846,42 @@ pub fn App() -> Html {
                 </section>
 
                 if !files.entries.is_empty() {
-                    <section class="mcpr-panel">
-                        <div class="mcpr-panel-body">
-                            <div class="mcpr-section-header">
-                                <h2 class="mcpr-section-title">
-                                { "Files" }
-                                    <span class="mcpr-badge">{ files.entries.len() }</span>
-                                </h2>
+                    <section class="mcpr-workspace">
+                        <aside class="mcpr-workspace-sidebar">
+                            <div class="mcpr-panel mcpr-files-panel">
+                                <div class="mcpr-panel-body">
+                                    <div class="mcpr-section-header">
+                                        <h2 class="mcpr-section-title">
+                                            { "Files" }
+                                            <span class="mcpr-badge">{ files.entries.len() }</span>
+                                        </h2>
+                                    </div>
+                                    <ul class="mcpr-file-list">{ file_rows }</ul>
+                                    { merge_settings }
+                                    { export_row }
+                                    if let Some(msg) = export_error.as_ref() {
+                                        <div class="alert text-sm py-2 mcpr-alert">{ msg }</div>
+                                    }
+                                </div>
                             </div>
-                            <ul class="mcpr-file-list">{ file_rows }</ul>
-                            { merge_settings }
-                            { export_row }
-                            if let Some(msg) = export_error.as_ref() {
-                                <div class="alert text-sm py-2 mcpr-alert">{ msg }</div>
+                        </aside>
+                        <div class="mcpr-workspace-main">
+                            if let Some((id, data)) = selected_file.as_ref() {
+                                <LoadedView key={id.to_string()} data={data.clone()} />
+                            } else {
+                                <section class="mcpr-panel">
+                                    <div class="mcpr-panel-body">
+                                        <div class="mcpr-section-header">
+                                            <h2 class="mcpr-section-title">{ "Events" }</h2>
+                                        </div>
+                                        <p class="mcpr-empty-copy">
+                                            { "読み込み済みファイルを選択すると、ファイル単位のイベントを表示します。" }
+                                        </p>
+                                    </div>
+                                </section>
                             }
                         </div>
                     </section>
-                }
-
-                if let Some(data) = merged.as_ref() {
-                    <LoadedView data={data.clone()} />
                 }
             </main>
         </div>
