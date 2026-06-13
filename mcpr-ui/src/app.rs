@@ -15,7 +15,7 @@ use web_sys::{DragEvent, Event, HtmlDetailsElement, HtmlInputElement};
 use yew::prelude::*;
 
 use crate::export::{
-    ExportFormat, ExportProgress, export_filename, export_merged, new_replay_uuid,
+    ExportFormat, ExportProgress, MergeInput, export_filename, export_merged, new_replay_uuid,
     trigger_download,
 };
 
@@ -245,7 +245,7 @@ pub struct Loaded {
     pub categories: Vec<Category>,
 }
 
-/// ファイル一覧の 1 エントリの読み込み状態。
+/// ファイルエントリの読み込み状態。
 #[derive(Clone)]
 enum EntryState {
     Loading,
@@ -259,25 +259,38 @@ enum EntryState {
     Error(String),
 }
 
-/// アップロードされた 1 ファイル。`id` は発番順の安定キー
-/// (Yew の key と読み込み中 FileReader の管理に使う)。
+/// 連結リストの 1 エントリの中身。ファイルと interval を同列に並べる。
 #[derive(Clone)]
-struct FileEntry {
-    id: u64,
-    filename: String,
-    state: EntryState,
+enum EntryKind {
+    File {
+        filename: String,
+        state: EntryState,
+    },
+    /// 連結時に直前までのタイムラインへ加算する空白。入力欄の原文を保持し、
+    /// parse 失敗は 0 扱い (旧 interval 入力欄と同じ方針)。
+    Interval {
+        input: String,
+    },
 }
 
-/// アップロード済みファイルの順序付きリスト。
+/// 連結リストの 1 エントリ。`id` は発番順の安定キー
+/// (Yew の key、読み込み中 FileReader の管理、DnD の並べ替えに使う)。
+#[derive(Clone)]
+struct Entry {
+    id: u64,
+    kind: EntryKind,
+}
+
+/// ファイルと interval の順序付きリスト。
 /// 複数の読み込み完了が並行して届くため、クロージャに古い状態を
 /// キャプチャしない reducer ([`FilesAction`]) で更新する。
 #[derive(Default)]
 struct FilesState {
-    entries: Vec<FileEntry>,
+    entries: Vec<Entry>,
 }
 
 enum FilesAction {
-    /// 読み込み開始 (Loading エントリを末尾へ追加)。
+    /// 読み込み開始 (Loading のファイルエントリを末尾へ追加)。
     Add {
         id: u64,
         filename: String,
@@ -286,6 +299,16 @@ enum FilesAction {
     Finish {
         id: u64,
         result: Result<(Rc<Loaded>, Rc<Vec<u8>>), String>,
+    },
+    /// interval エントリを末尾へ追加。
+    AddInterval {
+        id: u64,
+        input: String,
+    },
+    /// 既存 interval の値を差し替える (ダイアログ編集)。
+    SetInterval {
+        id: u64,
+        input: String,
     },
     Remove {
         id: u64,
@@ -300,20 +323,35 @@ impl Reducible for FilesState {
     type Action = FilesAction;
 
     fn reduce(self: Rc<Self>, action: FilesAction) -> Rc<Self> {
-        // FileEntry の clone は Rc + String のみで軽量。
+        // Entry の clone は Rc + String のみで軽量。
         let mut entries = self.entries.clone();
         match action {
-            FilesAction::Add { id, filename } => entries.push(FileEntry {
+            FilesAction::Add { id, filename } => entries.push(Entry {
                 id,
-                filename,
-                state: EntryState::Loading,
+                kind: EntryKind::File {
+                    filename,
+                    state: EntryState::Loading,
+                },
             }),
             FilesAction::Finish { id, result } => {
-                if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                    entry.state = match result {
+                if let Some(EntryKind::File { state, .. }) =
+                    entries.iter_mut().find(|e| e.id == id).map(|e| &mut e.kind)
+                {
+                    *state = match result {
                         Ok((loaded, bytes)) => EntryState::Loaded { loaded, bytes },
                         Err(msg) => EntryState::Error(msg),
                     };
+                }
+            }
+            FilesAction::AddInterval { id, input } => entries.push(Entry {
+                id,
+                kind: EntryKind::Interval { input },
+            }),
+            FilesAction::SetInterval { id, input } => {
+                if let Some(EntryKind::Interval { input: slot }) =
+                    entries.iter_mut().find(|e| e.id == id).map(|e| &mut e.kind)
+                {
+                    *slot = input;
                 }
             }
             FilesAction::Remove { id } => entries.retain(|e| e.id != id),
@@ -427,6 +465,22 @@ enum ExportPhase {
     Finishing,
 }
 
+/// interval 入力ダイアログの開閉と対象。`Add` は新規追加、`Edit(id)` は
+/// 既存 interval の値編集 (位置はそのまま)。
+#[derive(Clone, Copy, PartialEq)]
+enum IntervalDialog {
+    Closed,
+    Add,
+    Edit(u64),
+}
+
+/// 書き出し用に並び順のまま組む所有エントリ。借用版 [`MergeInput`] と違い、
+/// Replay は Rc を保持して async タスクへ move できる。
+enum OwnedItem {
+    Replay(Rc<Vec<u8>>),
+    Interval(u64),
+}
+
 #[function_component]
 pub fn App() -> Html {
     let files = use_reducer(FilesState::default);
@@ -437,11 +491,12 @@ pub fn App() -> Html {
     let just_moved_file_id = use_state(|| Option::<u64>::None);
     // 読み込み中の FileReader を id 別に保持。remove で drop され読み込みは中断される。
     let readers = use_mut_ref(HashMap::<u64, FileReader>::new);
-    // FileEntry::id の発番カウンタ。
+    // Entry::id の発番カウンタ。
     let next_id = use_mut_ref(|| 0u64);
 
-    // 連結設定。interval は入力欄の原文を保持し、parse 失敗は 0 扱い。
-    let interval_input = use_state(String::new);
+    // interval 入力ダイアログ。draft は数値欄の原文を保持し、parse 失敗は 0 扱い。
+    let interval_dialog = use_state(|| IntervalDialog::Closed);
+    let interval_draft = use_state(String::new);
 
     // 書き出し設定と進行状態 (None = 書き出し中でない)。
     let export_format = use_state(ExportFormat::default);
@@ -561,23 +616,77 @@ pub fn App() -> Html {
         })
     };
 
-    let interval_ms: u64 = interval_input.trim().parse().unwrap_or(0);
-
-    let selected_file = (*selected_file_id)
-        .and_then(|selected_id| {
-            files.entries.iter().find_map(|entry| match &entry.state {
-                EntryState::Loaded { loaded, .. } if entry.id == selected_id => {
-                    Some((entry.id, loaded.clone()))
-                }
-                _ => None,
-            })
+    // 「+」→「Add Interval」: 空の draft でダイアログを開き、ドロップダウンを閉じる。
+    let on_add_interval_item = {
+        let interval_dialog = interval_dialog.clone();
+        let interval_draft = interval_draft.clone();
+        let upload_dropdown_ref = upload_dropdown_ref.clone();
+        Callback::from(move |_: MouseEvent| {
+            interval_draft.set(String::new());
+            interval_dialog.set(IntervalDialog::Add);
+            if let Some(d) = upload_dropdown_ref.cast::<HtmlDetailsElement>() {
+                d.set_open(false);
+            }
         })
-        .or_else(|| {
-            files.entries.iter().find_map(|entry| match &entry.state {
-                EntryState::Loaded { loaded, .. } => Some((entry.id, loaded.clone())),
-                _ => None,
-            })
-        });
+    };
+    // interval 行の値クリック: 現在値を draft に載せて Edit モードで開く。
+    let on_edit_interval = {
+        let interval_dialog = interval_dialog.clone();
+        let interval_draft = interval_draft.clone();
+        Callback::from(move |(id, current): (u64, String)| {
+            interval_draft.set(current);
+            interval_dialog.set(IntervalDialog::Edit(id));
+        })
+    };
+    let on_interval_draft = {
+        let interval_draft = interval_draft.clone();
+        Callback::from(move |e: InputEvent| {
+            let input: HtmlInputElement = e.target_unchecked_into();
+            interval_draft.set(input.value());
+        })
+    };
+    let on_interval_confirm = {
+        let dispatch = files.dispatcher();
+        let next_id = next_id.clone();
+        let interval_dialog = interval_dialog.clone();
+        let interval_draft = interval_draft.clone();
+        Callback::from(move |_: MouseEvent| {
+            let input = (*interval_draft).clone();
+            match *interval_dialog {
+                IntervalDialog::Add => {
+                    let id = {
+                        let mut n = next_id.borrow_mut();
+                        *n += 1;
+                        *n
+                    };
+                    dispatch.dispatch(FilesAction::AddInterval { id, input });
+                }
+                IntervalDialog::Edit(id) => {
+                    dispatch.dispatch(FilesAction::SetInterval { id, input });
+                }
+                IntervalDialog::Closed => {}
+            }
+            interval_dialog.set(IntervalDialog::Closed);
+        })
+    };
+    let on_interval_cancel = {
+        let interval_dialog = interval_dialog.clone();
+        Callback::from(move |_: MouseEvent| interval_dialog.set(IntervalDialog::Closed))
+    };
+
+    // Loaded なファイルだけを選択対象にする (interval は対象外)。
+    let find_loaded = |want: Option<u64>| {
+        files.entries.iter().find_map(|entry| match &entry.kind {
+            EntryKind::File {
+                state: EntryState::Loaded { loaded, .. },
+                ..
+            } if want.is_none_or(|id| entry.id == id) => Some((entry.id, loaded.clone())),
+            _ => None,
+        })
+    };
+    let selected_file = (*selected_file_id)
+        .and_then(|selected_id| find_loaded(Some(selected_id)))
+        .or_else(|| find_loaded(None));
     let active_file_id = selected_file.as_ref().map(|(id, _)| *id);
 
     let on_remove_file = {
@@ -594,25 +703,23 @@ pub fn App() -> Html {
         })
     };
 
-    let file_rows = files
-        .entries
-        .iter()
-        .enumerate()
-        .map(|(i, entry)| {
+    // ファイルと interval を 1 つのリストに描画する。DnD ハンドラは id ベースで
+    // kind 非依存なので両 kind で共有し、interval 行はグリップだけを draggable に
+    // する (常設 input が無いので draggable 内 input の不具合は起きない)。
+    let file_rows = {
+        let mut rows: Vec<Html> = Vec::with_capacity(files.entries.len());
+        // 行 index 表示用のファイル連番 (interval は数えない)。
+        let mut file_no = 0usize;
+        for entry in files.entries.iter() {
             let id = entry.id;
-            let is_loaded = matches!(entry.state, EntryState::Loaded { .. });
-            let is_active = active_file_id == Some(id);
             let is_dragging = *dragging_file_id == Some(id);
             let is_drop_target = *drop_target_file_id == Some(id) && !is_dragging;
             let is_just_moved = *just_moved_file_id == Some(id);
-            let select = {
-                let selected_file_id = selected_file_id.clone();
-                Callback::from(move |_| {
-                    if is_loaded {
-                        selected_file_id.set(Some(id));
-                    }
-                })
-            };
+            let dnd_classes = classes!(
+                is_dragging.then_some("is-dragging"),
+                is_drop_target.then_some("is-drop-target"),
+                is_just_moved.then_some("is-just-moved"),
+            );
             let on_tab_dragstart = {
                 let dragging_file_id = dragging_file_id.clone();
                 Callback::from(move |e: DragEvent| {
@@ -677,61 +784,117 @@ pub fn App() -> Html {
                     drop_target_file_id.set(None);
                 })
             };
-            let status = match &entry.state {
-                EntryState::Loading => html! {
-                    <span class="loading loading-spinner loading-xs"></span>
-                },
-                EntryState::Loaded { loaded: l, .. } => html! {
-                    <>
-                        <span class="mcpr-badge">{ l.format }</span>
-                        <span class="mcpr-badge">{ format!("{} ms", l.info.duration_ms) }</span>
-                        <span class="mcpr-badge">{ format!("{} events", l.events.len()) }</span>
-                    </>
-                },
-                EntryState::Error(msg) => html! {
-                    <span class="text-sm truncate text-error" title={msg.clone()}>{ msg }</span>
-                },
-            };
-            html! {
-                <li key={id.to_string()} class={classes!(
-                    "mcpr-file-tab-row",
-                    is_active.then_some("is-active"),
-                    (!is_loaded).then_some("is-unavailable"),
-                    is_dragging.then_some("is-dragging"),
-                    is_drop_target.then_some("is-drop-target"),
-                    is_just_moved.then_some("is-just-moved"),
-                )}>
-                    <button type="button" class="mcpr-file-tab"
-                        draggable="true"
-                        aria-disabled={(!is_loaded).to_string()}
-                        onclick={select}
-                        ondragstart={on_tab_dragstart}
-                        ondragover={on_tab_dragover}
-                        ondrop={on_tab_drop}
-                        ondragend={on_tab_dragend}>
-                        <span class="mcpr-row-index">{ i }</span>
-                        <span class="mcpr-filename" title={entry.filename.clone()}>{ &entry.filename }</span>
-                        <span class="mcpr-file-status">{ status }</span>
-                    </button>
-                </li>
-            }
-        })
-        .collect::<Html>();
 
-    let on_interval = {
-        let interval_input = interval_input.clone();
-        Callback::from(move |e: InputEvent| {
-            let input: HtmlInputElement = e.target_unchecked_into();
-            interval_input.set(input.value());
-        })
+            let row = match &entry.kind {
+                EntryKind::File { filename, state } => {
+                    let is_loaded = matches!(state, EntryState::Loaded { .. });
+                    let is_active = active_file_id == Some(id);
+                    let index = file_no;
+                    file_no += 1;
+                    let select = {
+                        let selected_file_id = selected_file_id.clone();
+                        Callback::from(move |_| {
+                            if is_loaded {
+                                selected_file_id.set(Some(id));
+                            }
+                        })
+                    };
+                    let status = match state {
+                        EntryState::Loading => html! {
+                            <span class="loading loading-spinner loading-xs"></span>
+                        },
+                        EntryState::Loaded { loaded: l, .. } => html! {
+                            <>
+                                <span class="mcpr-badge">{ l.format }</span>
+                                <span class="mcpr-badge">{ format!("{} ms", l.info.duration_ms) }</span>
+                                <span class="mcpr-badge">{ format!("{} events", l.events.len()) }</span>
+                            </>
+                        },
+                        EntryState::Error(msg) => html! {
+                            <span class="text-sm truncate text-error" title={msg.clone()}>{ msg }</span>
+                        },
+                    };
+                    html! {
+                        <li key={id.to_string()} class={classes!(
+                            "mcpr-file-tab-row",
+                            is_active.then_some("is-active"),
+                            (!is_loaded).then_some("is-unavailable"),
+                            dnd_classes,
+                        )}>
+                            <button type="button" class="mcpr-file-tab"
+                                draggable="true"
+                                aria-disabled={(!is_loaded).to_string()}
+                                onclick={select}
+                                ondragstart={on_tab_dragstart}
+                                ondragover={on_tab_dragover}
+                                ondrop={on_tab_drop}
+                                ondragend={on_tab_dragend}>
+                                <span class="mcpr-row-index">{ index }</span>
+                                <span class="mcpr-filename" title={filename.clone()}>{ filename }</span>
+                                <span class="mcpr-file-status">{ status }</span>
+                            </button>
+                        </li>
+                    }
+                }
+                EntryKind::Interval { input } => {
+                    let value_ms = input.trim().parse::<u64>().unwrap_or(0);
+                    let edit = {
+                        let on_edit_interval = on_edit_interval.clone();
+                        let current = input.clone();
+                        Callback::from(move |_: MouseEvent| {
+                            on_edit_interval.emit((id, current.clone()));
+                        })
+                    };
+                    let remove = {
+                        let on_remove_file = on_remove_file.clone();
+                        Callback::from(move |_: MouseEvent| on_remove_file.emit(id))
+                    };
+                    html! {
+                        <li key={id.to_string()} class={classes!(
+                            "mcpr-file-tab-row", "mcpr-interval-row", dnd_classes,
+                        )}>
+                            <div class="mcpr-interval-tab"
+                                ondragover={on_tab_dragover}
+                                ondrop={on_tab_drop}>
+                                <span class="mcpr-interval-grip" draggable="true"
+                                    ondragstart={on_tab_dragstart}
+                                    ondragend={on_tab_dragend}
+                                    aria-label="並べ替え" title="ドラッグで並べ替え">
+                                    { "⠿" }
+                                </span>
+                                <span class="mcpr-row-index" aria-hidden="true">{ "⏱" }</span>
+                                <button type="button" class="mcpr-interval-value"
+                                    onclick={edit} title="クリックで interval を編集">
+                                    { format!("{value_ms} ms") }
+                                </button>
+                                <button type="button"
+                                    class="mcpr-icon-button mcpr-interval-remove"
+                                    aria-label="間隔を削除" title="間隔を削除"
+                                    onclick={remove}>
+                                    { "✕" }
+                                </button>
+                            </div>
+                        </li>
+                    }
+                }
+            };
+            rows.push(row);
+        }
+        rows.into_iter().collect::<Html>()
     };
-    // Export は全エントリの読み込み完了時のみ許可する
-    // (Loading/Error 混在時に一部だけ暗黙に書き出されるのを防ぐ)。
-    let all_loaded = !files.entries.is_empty()
-        && files
-            .entries
-            .iter()
-            .all(|e| matches!(e.state, EntryState::Loaded { .. }));
+
+    // Export は全ファイルの読み込み完了時のみ許可する (interval は阻害しない、
+    // ファイルが 1 件も無ければ書き出すものが無い)。
+    let file_count = files
+        .entries
+        .iter()
+        .filter(|e| matches!(e.kind, EntryKind::File { .. }))
+        .count();
+    let all_loaded = file_count > 0
+        && files.entries.iter().all(|e| match &e.kind {
+            EntryKind::File { state, .. } => matches!(state, EntryState::Loaded { .. }),
+            EntryKind::Interval { .. } => true,
+        });
 
     let on_export = {
         let files = files.clone();
@@ -742,22 +905,34 @@ pub fn App() -> Html {
             if export_phase.is_some() {
                 return;
             }
-            let mut inputs: Vec<(String, Rc<Vec<u8>>)> = Vec::new();
+            // 並び順のまま所有列を組む。Replay は Rc を持って async ブロックへ move し、
+            // 借用ビュー (&[MergeInput]) は move 後にブロック内で作る (借用がダングらない)。
+            let mut owned: Vec<OwnedItem> = Vec::new();
             let mut total = 0u64;
+            let mut first_filename: Option<String> = None;
+            let mut file_count = 0usize;
             for entry in &files.entries {
-                match &entry.state {
-                    EntryState::Loaded { loaded, bytes } => {
+                match &entry.kind {
+                    EntryKind::File {
+                        filename,
+                        state: EntryState::Loaded { loaded, bytes },
+                    } => {
                         total += loaded.events.len() as u64;
-                        inputs.push((entry.filename.clone(), bytes.clone()));
+                        first_filename.get_or_insert_with(|| filename.clone());
+                        file_count += 1;
+                        owned.push(OwnedItem::Replay(bytes.clone()));
                     }
-                    // ボタンの disabled と同条件の保険 (全件 Loaded のときだけ)。
-                    _ => return,
+                    // ボタンの disabled と同条件の保険 (全ファイル Loaded のときだけ)。
+                    EntryKind::File { .. } => return,
+                    EntryKind::Interval { input } => {
+                        owned.push(OwnedItem::Interval(input.trim().parse().unwrap_or(0)));
+                    }
                 }
             }
-            if inputs.is_empty() {
+            let Some(first_filename) = first_filename else {
                 return;
-            }
-            let filename = export_filename(&inputs[0].0, inputs.len() > 1, format);
+            };
+            let filename = export_filename(&first_filename, file_count > 1, format);
             export_phase.set(Some(ExportPhase::Preparing));
             export_error.set(None);
             let export_phase = export_phase.clone();
@@ -765,7 +940,13 @@ pub fn App() -> Html {
             // export_merged は一定イベント数ごとにブラウザへ yield するため、
             // async タスクとして流せば書き出し中も進捗バーが再描画される。
             yew::platform::spawn_local(async move {
-                let refs: Vec<&[u8]> = inputs.iter().map(|(_, b)| b.as_slice()).collect();
+                let items: Vec<MergeInput> = owned
+                    .iter()
+                    .map(|it| match it {
+                        OwnedItem::Replay(b) => MergeInput::Replay(b.as_slice()),
+                        OwnedItem::Interval(ms) => MergeInput::Interval(*ms),
+                    })
+                    .collect();
                 let on_progress = {
                     let export_phase = export_phase.clone();
                     move |progress| {
@@ -779,7 +960,7 @@ pub fn App() -> Html {
                     }
                 };
                 let result =
-                    export_merged(&refs, interval_ms, format, new_replay_uuid(), on_progress).await;
+                    export_merged(&items, format, new_replay_uuid(), on_progress).await;
                 match result {
                     Ok(bytes) => trigger_download(&bytes, &filename),
                     Err(e) => export_error.set(Some(format!("export error: {e}"))),
@@ -855,20 +1036,11 @@ pub fn App() -> Html {
         </div>
     };
 
-    // 連結設定は 2 件以上で意味を持つときだけ出す。
-    let merge_settings = (files.entries.len() >= 2).then(|| {
-        html! {
-            <div class="mcpr-divider-row mcpr-merge-settings text-sm">
-                <label class="mcpr-field-row">
-                    { "interval (ms)" }
-                    <input type="number" min="0"
-                        class="input input-bordered input-sm w-28 font-mono mcpr-form-input"
-                        value={(*interval_input).clone()}
-                        oninput={on_interval} />
-                </label>
-            </div>
-        }
-    });
+    let interval_dialog_open = *interval_dialog != IntervalDialog::Closed;
+    let (interval_dialog_title, interval_confirm_label) = match *interval_dialog {
+        IntervalDialog::Edit(_) => ("interval を編集", "保存"),
+        _ => ("interval を追加", "追加"),
+    };
 
     html! {
         <div class="mcpr-shell">
@@ -928,11 +1100,11 @@ pub fn App() -> Html {
                                     <div class="mcpr-section-header">
                                         <h2 class="mcpr-section-title">
                                             { "Files" }
-                                            <span class="mcpr-badge">{ files.entries.len() }</span>
+                                            <span class="mcpr-badge">{ file_count }</span>
                                         </h2>
                                         <details class="dropdown dropdown-end" ref={upload_dropdown_ref.clone()}>
                                             <summary class="mcpr-icon-button"
-                                                aria-label="ファイルを追加" title="ファイルを追加">
+                                                aria-label="追加" title="追加">
                                                 { "+" }
                                             </summary>
                                             <ul class="dropdown-content menu mcpr-dropdown-menu">
@@ -941,11 +1113,15 @@ pub fn App() -> Html {
                                                         { "Upload Files" }
                                                     </button>
                                                 </li>
+                                                <li>
+                                                    <button type="button" onclick={on_add_interval_item}>
+                                                        { "Add Interval" }
+                                                    </button>
+                                                </li>
                                             </ul>
                                         </details>
                                     </div>
                                     <ul class="mcpr-file-list">{ file_rows }</ul>
-                                    { merge_settings }
                                     { export_row }
                                     if let Some(msg) = export_error.as_ref() {
                                         <div class="alert text-sm py-2 mcpr-alert">{ msg }</div>
@@ -1001,6 +1177,34 @@ pub fn App() -> Html {
                     </div>
                     // 背景クリックで閉じる
                     <div class="modal-backdrop" onclick={on_close_modal}></div>
+                </div>
+
+                <div class={classes!("modal", interval_dialog_open.then_some("modal-open"))}
+                    role="dialog" aria-modal="true">
+                    <div class="modal-box mcpr-interval-dialog-box">
+                        <div class="mcpr-section-header">
+                            <h3 class="mcpr-section-title">{ interval_dialog_title }</h3>
+                            <button type="button" class="mcpr-icon-button"
+                                aria-label="閉じる" title="閉じる" onclick={on_interval_cancel.clone()}>
+                                { "✕" }
+                            </button>
+                        </div>
+                        <label class="mcpr-field-row">
+                            { "interval (ms)" }
+                            <input type="number" min="0"
+                                class="input input-bordered input-sm w-28 font-mono mcpr-form-input"
+                                value={(*interval_draft).clone()}
+                                oninput={on_interval_draft} />
+                        </label>
+                        <div class="flex justify-end">
+                            <button type="button" class="btn btn-sm mcpr-btn mcpr-btn-primary"
+                                onclick={on_interval_confirm}>
+                                { interval_confirm_label }
+                            </button>
+                        </div>
+                    </div>
+                    // 背景クリックで閉じる
+                    <div class="modal-backdrop" onclick={on_interval_cancel}></div>
                 </div>
             </main>
         </div>
@@ -1321,15 +1525,26 @@ mod tests {
         }
     }
 
-    fn loading_file(id: u64) -> FileEntry {
-        FileEntry {
+    fn loading_file(id: u64) -> Entry {
+        Entry {
             id,
-            filename: format!("{id}.mcpr"),
-            state: EntryState::Loading,
+            kind: EntryKind::File {
+                filename: format!("{id}.mcpr"),
+                state: EntryState::Loading,
+            },
         }
     }
 
-    fn file_ids(state: &FilesState) -> Vec<u64> {
+    fn interval_entry(id: u64, input: &str) -> Entry {
+        Entry {
+            id,
+            kind: EntryKind::Interval {
+                input: input.to_string(),
+            },
+        }
+    }
+
+    fn entry_ids(state: &FilesState) -> Vec<u64> {
         state.entries.iter().map(|entry| entry.id).collect()
     }
 
@@ -1343,13 +1558,49 @@ mod tests {
             dragged_id: 1,
             target_id: 3,
         });
-        assert_eq!(file_ids(&state), vec![2, 3, 1]);
+        assert_eq!(entry_ids(&state), vec![2, 3, 1]);
 
         let state = state.reduce(FilesAction::Reorder {
             dragged_id: 1,
             target_id: 2,
         });
-        assert_eq!(file_ids(&state), vec![1, 2, 3]);
+        assert_eq!(entry_ids(&state), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn interval_reorders_among_files_like_a_file() {
+        // ファイル・ファイル・interval を並べ、interval を id ベースで先頭へ。
+        let state = Rc::new(FilesState {
+            entries: vec![loading_file(1), loading_file(2), interval_entry(3, "500")],
+        });
+
+        let state = state.reduce(FilesAction::Reorder {
+            dragged_id: 3,
+            target_id: 1,
+        });
+        assert_eq!(entry_ids(&state), vec![3, 1, 2]);
+    }
+
+    #[test]
+    fn set_interval_updates_only_matching_interval() {
+        let state = Rc::new(FilesState {
+            entries: vec![loading_file(1), interval_entry(2, "500")],
+        });
+
+        let state = state.reduce(FilesAction::SetInterval {
+            id: 2,
+            input: "1200".to_string(),
+        });
+
+        let inputs: Vec<Option<&str>> = state
+            .entries
+            .iter()
+            .map(|e| match &e.kind {
+                EntryKind::Interval { input } => Some(input.as_str()),
+                EntryKind::File { .. } => None,
+            })
+            .collect();
+        assert_eq!(inputs, vec![None, Some("1200")]);
     }
 
     #[test]

@@ -44,6 +44,15 @@ impl ExportFormat {
     }
 }
 
+/// [`export_merged`] の順序付き入力 1 件。リプレイと interval (空白) を
+/// 同列に並べ、出現順にタイムラインへ積む。
+pub enum MergeInput<'a> {
+    /// リプレイ zip のバイト列。
+    Replay(&'a [u8]),
+    /// 直前までのタイムラインへ加算する空白 (ms)。
+    Interval(u64),
+}
+
 /// [`export_merged`] の進捗通知。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExportProgress {
@@ -117,25 +126,31 @@ impl ExportSink {
     }
 }
 
-/// 順序付き入力 (リプレイ zip のバイト列) を連結して 1 本のリプレイ zip を
-/// 生成する。各入力の時刻に累積オフセット (各入力の duration + interval) を
-/// 加算するだけで、行のフィルタはしない。
+/// 順序付き入力 (リプレイ zip と interval) を連結して 1 本のリプレイ zip を
+/// 生成する。リストを先頭から走査し、リプレイは現在のオフセットで時刻を積んで
+/// から duration ぶんオフセットを進め、interval はその ms ぶんオフセットを
+/// 進める。行のフィルタはしない。
+///
+/// interval が位置依存になったため、先頭・連続・末尾の interval もすべて
+/// オフセットへ自然に反映される (末尾 interval は最終 duration を伸ばす)。
 ///
 /// `replay_uuid` は Flashback 出力の metadata に書くリプレイ uuid
 /// (乱数生成は呼び出し側の責務。テストでは `Uuid::nil()` で決定的に)。
 /// `on_progress` には最初のイベント、[`YIELD_EVERY_EVENTS`] ごと、
-/// 各入力の処理完了時、および終端処理の開始時に進捗が届く。
+/// 各リプレイの処理完了時、および終端処理の開始時に進捗が届く。
 ///
-/// 注意: 複数入力を .mcpr へ書くと、2 個目の Login パケットで state が
-/// 後退するためエラーになる (.mcpr の連結は単一入力のみ対応)。
+/// 注意: 複数リプレイを .mcpr へ書くと、2 個目の Login パケットで state が
+/// 後退するためエラーになる (.mcpr の連結は単一リプレイのみ対応)。
 pub async fn export_merged(
-    inputs: &[&[u8]],
-    interval_ms: u64,
+    items: &[MergeInput<'_>],
     format: ExportFormat,
     replay_uuid: uuid::Uuid,
     mut on_progress: impl FnMut(ExportProgress),
 ) -> anyhow::Result<Vec<u8>> {
-    anyhow::ensure!(!inputs.is_empty(), "no input replays");
+    anyhow::ensure!(
+        items.iter().any(|i| matches!(i, MergeInput::Replay(_))),
+        "no input replays"
+    );
 
     let mut sink: Option<ExportSink> = None;
     let mut players = BTreeSet::new();
@@ -146,7 +161,15 @@ pub async fn export_merged(
     // クリック直後の UI 状態を一度描画させてから重い再パースへ入る。
     yield_to_browser().await;
 
-    for &bytes in inputs {
+    for item in items {
+        let bytes = match item {
+            // interval はオフセットを進めるだけ (イベント処理なし)。
+            MergeInput::Interval(ms) => {
+                offset_ms += ms;
+                continue;
+            }
+            MergeInput::Replay(bytes) => *bytes,
+        };
         let mut zip = ZipArchiveReader::new(Cursor::new(bytes))?;
         // McprEventSource は reader を借用するため、match の外で生かす
         let mut mcpr_reader;
@@ -179,7 +202,7 @@ pub async fn export_merged(
         yield_to_browser().await;
 
         players.extend(info.players.iter().cloned());
-        offset_ms += info.duration_ms + interval_ms;
+        offset_ms += info.duration_ms;
         base_info.get_or_insert(info);
     }
 
@@ -188,12 +211,13 @@ pub async fn export_merged(
     yield_to_browser().await;
 
     let info = ReplayInfo {
-        duration_ms: offset_ms.saturating_sub(interval_ms),
+        duration_ms: offset_ms,
         players,
         // mc_version / protocol_version / data_version は先頭から継承
-        ..base_info.expect("inputs is non-empty")
+        ..base_info.expect("at least one replay is ensured above")
     };
-    sink.expect("inputs is non-empty").finish_into_bytes(&info)
+    sink.expect("at least one replay is ensured above")
+        .finish_into_bytes(&info)
 }
 
 /// ダウンロードファイル名。単一入力は先頭ファイル名の拡張子差し替え、
@@ -263,12 +287,11 @@ mod tests {
 
     /// 進捗を無視して [`export_merged`] を同期実行するテスト用ラッパ。
     fn export(
-        inputs: &[&[u8]],
-        interval_ms: u64,
+        items: &[MergeInput<'_>],
         format: ExportFormat,
         replay_uuid: uuid::Uuid,
     ) -> anyhow::Result<Vec<u8>> {
-        block_on(export_merged(inputs, interval_ms, format, replay_uuid, |_| {}))
+        block_on(export_merged(items, format, replay_uuid, |_| {}))
     }
 
     fn packet(time_ms: u64, state: State, id: i32, data: &[u8]) -> Event {
@@ -328,7 +351,12 @@ mod tests {
         let events = full_stream(&[100, 250]);
         let input = mcpr_fixture(events.clone(), &info(1000, &[1, 2]));
 
-        let out = export(&[&input], 0, ExportFormat::Mcpr, uuid::Uuid::nil()).unwrap();
+        let out = export(
+            &[MergeInput::Replay(&input)],
+            ExportFormat::Mcpr,
+            uuid::Uuid::nil(),
+        )
+        .unwrap();
 
         let (out_info, out_events) = read_mcpr(&out);
         assert_eq!(out_events, events);
@@ -345,7 +373,12 @@ mod tests {
         let a = mcpr_fixture(full_stream(&[20]), &info(500, &[]));
         let b = mcpr_fixture(full_stream(&[30]), &info(300, &[]));
 
-        let err = export(&[&a, &b], 0, ExportFormat::Mcpr, uuid::Uuid::nil()).unwrap_err();
+        let err = export(
+            &[MergeInput::Replay(&a), MergeInput::Replay(&b)],
+            ExportFormat::Mcpr,
+            uuid::Uuid::nil(),
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("transition"), "{err}");
     }
 
@@ -353,7 +386,12 @@ mod tests {
     fn flashback_output_writes_metadata_and_ticks() {
         let input = mcpr_fixture(full_stream(&[0, 50, 120]), &info(1000, &[]));
 
-        let out = export(&[&input], 0, ExportFormat::Flashback, uuid::Uuid::nil()).unwrap();
+        let out = export(
+            &[MergeInput::Replay(&input)],
+            ExportFormat::Flashback,
+            uuid::Uuid::nil(),
+        )
+        .unwrap();
 
         let mut zip = ZipArchiveReader::new(Cursor::new(out.as_slice())).unwrap();
         assert_eq!(detect_format(&mut zip).unwrap(), ReplayFormat::Flashback);
@@ -391,8 +429,7 @@ mod tests {
 
         let mut progress = Vec::new();
         block_on(export_merged(
-            &[&input],
-            0,
+            &[MergeInput::Replay(&input)],
             ExportFormat::Mcpr,
             uuid::Uuid::nil(),
             |p| progress.push(p),
@@ -412,7 +449,59 @@ mod tests {
 
     #[test]
     fn empty_inputs_fail() {
-        assert!(export(&[], 0, ExportFormat::Mcpr, uuid::Uuid::nil()).is_err());
+        assert!(export(&[], ExportFormat::Mcpr, uuid::Uuid::nil()).is_err());
+    }
+
+    #[test]
+    fn interval_only_input_fails() {
+        // リプレイが 1 件も無ければ書き出せない。
+        assert!(
+            export(
+                &[MergeInput::Interval(500)],
+                ExportFormat::Mcpr,
+                uuid::Uuid::nil()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn leading_interval_shifts_events_and_extends_duration() {
+        let events = full_stream(&[100, 250]);
+        let input = mcpr_fixture(events, &info(1000, &[]));
+
+        let out = export(
+            &[MergeInput::Interval(500), MergeInput::Replay(&input)],
+            ExportFormat::Mcpr,
+            uuid::Uuid::nil(),
+        )
+        .unwrap();
+
+        let (out_info, out_events) = read_mcpr(&out);
+        // 先頭 interval ぶん全イベントが後ろへずれる (Login/Config も含む)。
+        let times: Vec<u64> = out_events.iter().map(|e| e.time().as_millis()).collect();
+        assert_eq!(times, vec![500, 500, 600, 750]);
+        // duration = interval + duration
+        assert_eq!(out_info.duration_ms, 1500);
+    }
+
+    #[test]
+    fn trailing_interval_extends_duration_only() {
+        let events = full_stream(&[100]);
+        let input = mcpr_fixture(events, &info(1000, &[]));
+
+        let out = export(
+            &[MergeInput::Replay(&input), MergeInput::Interval(500)],
+            ExportFormat::Mcpr,
+            uuid::Uuid::nil(),
+        )
+        .unwrap();
+
+        let (out_info, out_events) = read_mcpr(&out);
+        // イベント時刻はずれず、duration だけ伸びる。
+        let times: Vec<u64> = out_events.iter().map(|e| e.time().as_millis()).collect();
+        assert_eq!(times, vec![0, 0, 100]);
+        assert_eq!(out_info.duration_ms, 1500);
     }
 
     #[test]
