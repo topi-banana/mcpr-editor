@@ -379,10 +379,6 @@
   }
 
   .mcpr-file-tab-row {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) auto;
-    gap: 8px;
-    align-items: stretch;
     min-width: 0;
   }
 
@@ -397,10 +393,17 @@
     border-radius: 8px;
     background: var(--mcpr-canvas-soft);
     padding: 8px 10px;
+    cursor: grab;
     text-align: left;
+    transition:
+      border-color 120ms ease,
+      background-color 120ms ease,
+      box-shadow 120ms ease,
+      opacity 120ms ease;
+    width: 100%;
   }
 
-  .mcpr-file-tab:hover:not(:disabled) {
+  .mcpr-file-tab:hover {
     border-color: var(--mcpr-hairline-strong);
     background: var(--mcpr-canvas);
   }
@@ -410,8 +413,9 @@
     outline-offset: 2px;
   }
 
-  .mcpr-file-tab:disabled {
-    cursor: default;
+  .mcpr-file-tab-row.is-dragging .mcpr-file-tab {
+    cursor: grabbing;
+    opacity: 0.56;
   }
 
   .mcpr-file-tab-row.is-active .mcpr-file-tab {
@@ -420,13 +424,14 @@
     box-shadow: inset 3px 0 0 var(--mcpr-ink);
   }
 
-  .mcpr-file-tab .mcpr-file-status {
-    grid-column: 2;
+  .mcpr-file-tab-row.is-drop-target .mcpr-file-tab {
+    border-color: var(--mcpr-link);
+    background: color-mix(in srgb, var(--mcpr-link) 8%, var(--mcpr-canvas));
+    box-shadow: inset 3px 0 0 var(--mcpr-link);
   }
 
-  .mcpr-file-actions {
-    align-self: center;
-    justify-self: end;
+  .mcpr-file-tab .mcpr-file-status {
+    grid-column: 2;
   }
 
   .mcpr-row-index {

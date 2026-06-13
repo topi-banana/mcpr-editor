@@ -293,11 +293,9 @@ enum FilesAction {
     Remove {
         id: u64,
     },
-    MoveUp {
-        id: u64,
-    },
-    MoveDown {
-        id: u64,
+    Reorder {
+        dragged_id: u64,
+        target_id: u64,
     },
 }
 
@@ -322,18 +320,16 @@ impl Reducible for FilesState {
                 }
             }
             FilesAction::Remove { id } => entries.retain(|e| e.id != id),
-            FilesAction::MoveUp { id } => {
-                if let Some(i) = entries.iter().position(|e| e.id == id)
-                    && i > 0
+            FilesAction::Reorder {
+                dragged_id,
+                target_id,
+            } => {
+                if dragged_id != target_id
+                    && let Some(from) = entries.iter().position(|e| e.id == dragged_id)
+                    && let Some(to) = entries.iter().position(|e| e.id == target_id)
                 {
-                    entries.swap(i - 1, i);
-                }
-            }
-            FilesAction::MoveDown { id } => {
-                if let Some(i) = entries.iter().position(|e| e.id == id)
-                    && i + 1 < entries.len()
-                {
-                    entries.swap(i, i + 1);
+                    let entry = entries.remove(from);
+                    entries.insert(to.min(entries.len()), entry);
                 }
             }
         }
@@ -438,6 +434,8 @@ enum ExportPhase {
 pub fn App() -> Html {
     let files = use_reducer(FilesState::default);
     let selected_file_id = use_state(|| Option::<u64>::None);
+    let dragging_file_id = use_state(|| Option::<u64>::None);
+    let drop_target_file_id = use_state(|| Option::<u64>::None);
     // 読み込み中の FileReader を id 別に保持。remove で drop され読み込みは中断される。
     let readers = use_mut_ref(HashMap::<u64, FileReader>::new);
     // FileEntry::id の発番カウンタ。
@@ -521,7 +519,7 @@ pub fn App() -> Html {
         })
     };
 
-    let on_dragover = Callback::from(|e: DragEvent| e.prevent_default());
+    let on_upload_dragover = Callback::from(|e: DragEvent| e.prevent_default());
 
     let interval_ms: u64 = interval_input.trim().parse().unwrap_or(0);
 
@@ -542,15 +540,20 @@ pub fn App() -> Html {
         });
     let active_file_id = selected_file.as_ref().map(|(id, _)| *id);
 
-    let last = files.entries.len().saturating_sub(1);
-    // 行ボタン用: id に対するアクションを dispatch する Callback を作る。
-    let row_action = {
+    let on_remove_file = {
         let dispatch = files.dispatcher();
-        move |make: fn(u64) -> FilesAction, id: u64| {
-            let dispatch = dispatch.clone();
-            Callback::from(move |_| dispatch.dispatch(make(id)))
-        }
+        let readers = readers.clone();
+        let selected_file_id = selected_file_id.clone();
+        Callback::from(move |id: u64| {
+            // 読み込み中なら FileReader の drop で中断される。
+            readers.borrow_mut().remove(&id);
+            if *selected_file_id == Some(id) {
+                selected_file_id.set(None);
+            }
+            dispatch.dispatch(FilesAction::Remove { id });
+        })
     };
+
     let file_rows = files
         .entries
         .iter()
@@ -559,6 +562,8 @@ pub fn App() -> Html {
             let id = entry.id;
             let is_loaded = matches!(entry.state, EntryState::Loaded { .. });
             let is_active = active_file_id == Some(id);
+            let is_dragging = *dragging_file_id == Some(id);
+            let is_drop_target = *drop_target_file_id == Some(id) && !is_dragging;
             let select = {
                 let selected_file_id = selected_file_id.clone();
                 Callback::from(move |_| {
@@ -567,15 +572,57 @@ pub fn App() -> Html {
                     }
                 })
             };
-            let up = row_action(|id| FilesAction::MoveUp { id }, id);
-            let down = row_action(|id| FilesAction::MoveDown { id }, id);
-            let remove = {
+            let on_tab_dragstart = {
+                let dragging_file_id = dragging_file_id.clone();
+                Callback::from(move |e: DragEvent| {
+                    e.stop_propagation();
+                    dragging_file_id.set(Some(id));
+                    if let Some(dt) = e.data_transfer() {
+                        dt.set_effect_allowed("move");
+                        let _ = dt.set_data("text/plain", &id.to_string());
+                    }
+                })
+            };
+            let on_tab_dragover = {
+                let drop_target_file_id = drop_target_file_id.clone();
+                Callback::from(move |e: DragEvent| {
+                    e.prevent_default();
+                    e.stop_propagation();
+                    if let Some(dt) = e.data_transfer() {
+                        dt.set_drop_effect("move");
+                    }
+                    drop_target_file_id.set(Some(id));
+                })
+            };
+            let on_tab_drop = {
                 let dispatch = files.dispatcher();
-                let readers = readers.clone();
-                Callback::from(move |_| {
-                    // 読み込み中なら FileReader の drop で中断される。
-                    readers.borrow_mut().remove(&id);
-                    dispatch.dispatch(FilesAction::Remove { id });
+                let dragging_file_id = dragging_file_id.clone();
+                let drop_target_file_id = drop_target_file_id.clone();
+                Callback::from(move |e: DragEvent| {
+                    e.prevent_default();
+                    e.stop_propagation();
+                    let dragged_id = (*dragging_file_id).or_else(|| {
+                        e.data_transfer()
+                            .and_then(|dt| dt.get_data("text/plain").ok())
+                            .and_then(|id| id.parse::<u64>().ok())
+                    });
+                    if let Some(dragged_id) = dragged_id {
+                        dispatch.dispatch(FilesAction::Reorder {
+                            dragged_id,
+                            target_id: id,
+                        });
+                    }
+                    dragging_file_id.set(None);
+                    drop_target_file_id.set(None);
+                })
+            };
+            let on_tab_dragend = {
+                let dragging_file_id = dragging_file_id.clone();
+                let drop_target_file_id = drop_target_file_id.clone();
+                Callback::from(move |e: DragEvent| {
+                    e.stop_propagation();
+                    dragging_file_id.set(None);
+                    drop_target_file_id.set(None);
                 })
             };
             let status = match &entry.state {
@@ -594,22 +641,25 @@ pub fn App() -> Html {
                 },
             };
             html! {
-                <li key={id.to_string()} class={classes!("mcpr-file-tab-row", is_active.then_some("is-active"))}>
+                <li key={id.to_string()} class={classes!(
+                    "mcpr-file-tab-row",
+                    is_active.then_some("is-active"),
+                    (!is_loaded).then_some("is-unavailable"),
+                    is_dragging.then_some("is-dragging"),
+                    is_drop_target.then_some("is-drop-target"),
+                )}>
                     <button type="button" class="mcpr-file-tab"
-                        disabled={!is_loaded}
-                        onclick={select}>
+                        draggable="true"
+                        aria-disabled={(!is_loaded).to_string()}
+                        onclick={select}
+                        ondragstart={on_tab_dragstart}
+                        ondragover={on_tab_dragover}
+                        ondrop={on_tab_drop}
+                        ondragend={on_tab_dragend}>
                         <span class="mcpr-row-index">{ i }</span>
                         <span class="mcpr-filename" title={entry.filename.clone()}>{ &entry.filename }</span>
                         <span class="mcpr-file-status">{ status }</span>
                     </button>
-                    <div class="join mcpr-file-actions">
-                        <button class="btn btn-xs join-item mcpr-btn mcpr-btn-secondary" title="上へ"
-                            disabled={i == 0} onclick={up}>{ "↑" }</button>
-                        <button class="btn btn-xs join-item mcpr-btn mcpr-btn-secondary" title="下へ"
-                            disabled={i == last} onclick={down}>{ "↓" }</button>
-                        <button class="btn btn-xs join-item mcpr-btn mcpr-btn-danger" title="削除"
-                            onclick={remove}>{ "✕" }</button>
-                    </div>
                 </li>
             }
         })
@@ -821,7 +871,7 @@ pub fn App() -> Html {
 
             <main class="mcpr-page space-y-6">
                 <section class="mcpr-hero"
-                    ondragover={on_dragover}
+                    ondragover={on_upload_dragover}
                     ondrop={on_drop_handler}>
                     <div class="mcpr-hero-body">
                         <div class="space-y-3">
@@ -867,7 +917,10 @@ pub fn App() -> Html {
                         </aside>
                         <div class="mcpr-workspace-main">
                             if let Some((id, data)) = selected_file.as_ref() {
-                                <LoadedView key={id.to_string()} data={data.clone()} />
+                                <LoadedView key={id.to_string()}
+                                    id={*id}
+                                    data={data.clone()}
+                                    on_remove={on_remove_file.clone()} />
                             } else {
                                 <section class="mcpr-panel">
                                     <div class="mcpr-panel-body">
@@ -890,14 +943,16 @@ pub fn App() -> Html {
 
 #[derive(Properties)]
 struct LoadedViewProps {
+    id: u64,
     data: Rc<Loaded>,
+    on_remove: Callback<u64>,
 }
 
 /// events の深い比較 (数百万行になり得る) を避け、merge 結果の
 /// ポインタ同一性だけで再描画を判定する。
 impl PartialEq for LoadedViewProps {
     fn eq(&self, other: &Self) -> bool {
-        Rc::ptr_eq(&self.data, &other.data)
+        self.id == other.id && Rc::ptr_eq(&self.data, &other.data)
     }
 }
 
@@ -1050,6 +1105,12 @@ fn LoadedView(props: &LoadedViewProps) -> Html {
         })
     };
 
+    let on_remove = {
+        let on_remove = props.on_remove.clone();
+        let id = props.id;
+        Callback::from(move |_| on_remove.emit(id))
+    };
+
     let rows = (start..end)
         .map(|pos| {
             let orig = indices.as_ref().map_or(pos, |v| v[pos]);
@@ -1083,6 +1144,12 @@ fn LoadedView(props: &LoadedViewProps) -> Html {
                 <div class="mcpr-panel-body">
                     <div class="mcpr-section-header">
                         <h2 class="mcpr-section-title">{ "Metadata" }</h2>
+                        <button type="button"
+                            class="btn btn-sm mcpr-btn mcpr-btn-danger"
+                            title="このファイルを削除"
+                            onclick={on_remove}>
+                            { "Delete" }
+                        </button>
                     </div>
                     <div class="mcpr-meta-grid">
                         <MetaRow label="File" value={props.data.filename.clone()} />
@@ -1186,6 +1253,37 @@ mod tests {
             },
             size: 0,
         }
+    }
+
+    fn loading_file(id: u64) -> FileEntry {
+        FileEntry {
+            id,
+            filename: format!("{id}.mcpr"),
+            state: EntryState::Loading,
+        }
+    }
+
+    fn file_ids(state: &FilesState) -> Vec<u64> {
+        state.entries.iter().map(|entry| entry.id).collect()
+    }
+
+    #[test]
+    fn file_reorder_moves_dragged_entry_to_drop_target_boundary() {
+        let state = Rc::new(FilesState {
+            entries: vec![loading_file(1), loading_file(2), loading_file(3)],
+        });
+
+        let state = state.reduce(FilesAction::Reorder {
+            dragged_id: 1,
+            target_id: 3,
+        });
+        assert_eq!(file_ids(&state), vec![2, 3, 1]);
+
+        let state = state.reduce(FilesAction::Reorder {
+            dragged_id: 1,
+            target_id: 2,
+        });
+        assert_eq!(file_ids(&state), vec![1, 2, 3]);
     }
 
     #[test]
