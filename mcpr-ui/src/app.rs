@@ -14,12 +14,9 @@ use mcpr_lib::{
 use web_sys::{DragEvent, Event, HtmlDetailsElement, HtmlInputElement};
 use yew::prelude::*;
 
-use crate::{
-    export::{
-        ExportFormat, ExportProgress, export_filename, export_merged, new_replay_uuid,
-        trigger_download,
-    },
-    merge::MergeRule,
+use crate::export::{
+    ExportFormat, ExportProgress, export_filename, export_merged, new_replay_uuid,
+    trigger_download,
 };
 
 const PAGE_SIZE: usize = 200;
@@ -445,7 +442,6 @@ pub fn App() -> Html {
 
     // 連結設定。interval は入力欄の原文を保持し、parse 失敗は 0 扱い。
     let interval_input = use_state(String::new);
-    let rule = use_state(MergeRule::default);
 
     // 書き出し設定と進行状態 (None = 書き出し中でない)。
     let export_format = use_state(ExportFormat::default);
@@ -729,11 +725,6 @@ pub fn App() -> Html {
             interval_input.set(input.value());
         })
     };
-    let on_toggle_rule = {
-        let rule = rule.clone();
-        Callback::from(move |_: Event| rule.set(rule.toggled()))
-    };
-
     // Export は全エントリの読み込み完了時のみ許可する
     // (Loading/Error 混在時に一部だけ暗黙に書き出されるのを防ぐ)。
     let all_loaded = !files.entries.is_empty()
@@ -747,7 +738,6 @@ pub fn App() -> Html {
         let export_phase = export_phase.clone();
         let export_error = export_error.clone();
         let format = *export_format;
-        let rule = *rule;
         Callback::from(move |_: MouseEvent| {
             if export_phase.is_some() {
                 return;
@@ -788,15 +778,8 @@ pub fn App() -> Html {
                         }));
                     }
                 };
-                let result = export_merged(
-                    &refs,
-                    interval_ms,
-                    rule,
-                    format,
-                    new_replay_uuid(),
-                    on_progress,
-                )
-                .await;
+                let result =
+                    export_merged(&refs, interval_ms, format, new_replay_uuid(), on_progress).await;
                 match result {
                     Ok(bytes) => trigger_download(&bytes, &filename),
                     Err(e) => export_error.set(Some(format!("export error: {e}"))),
@@ -882,12 +865,6 @@ pub fn App() -> Html {
                         class="input input-bordered input-sm w-28 font-mono mcpr-form-input"
                         value={(*interval_input).clone()}
                         oninput={on_interval} />
-                </label>
-                <label class="mcpr-toggle-row">
-                    <input type="checkbox" class="toggle toggle-sm toggle-primary"
-                        checked={*rule == MergeRule::CliCompatible}
-                        onchange={on_toggle_rule} />
-                    { "CLI互換フィルタ (2個目以降は Play のみ / Login(play) 0x2b 除外)" }
                 </label>
             </div>
         }

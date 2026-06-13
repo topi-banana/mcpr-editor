@@ -553,22 +553,12 @@
     gap: 12px;
   }
 
-  .mcpr-field-row,
-  .mcpr-toggle-row {
+  .mcpr-field-row {
     display: flex;
     align-items: center;
     gap: 8px;
     color: var(--mcpr-body);
-  }
-
-  .mcpr-field-row {
     justify-content: space-between;
-  }
-
-  .mcpr-toggle-row {
-    align-items: flex-start;
-    cursor: pointer;
-    line-height: 20px;
   }
 
   .mcpr-form-input {
