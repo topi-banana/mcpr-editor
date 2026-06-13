@@ -44,11 +44,25 @@ impl ExportFormat {
     }
 }
 
+/// 書き出し時にパケットを採否する判定。元イベント index (表示行 [`EventRow`]
+/// と同順) を受け取り、出力へ含めるなら true を返す。
+///
+/// export は入力 zip を再パースするため、UI で選択した表示行の index が
+/// そのまま再パース列の index と一致する (1 入力ごとに 0 起算)。
+///
+/// [`EventRow`]: crate::app::EventRow
+pub trait PacketFilter {
+    fn keep(&self, index: usize) -> bool;
+}
+
 /// [`export_merged`] の順序付き入力 1 件。リプレイと interval (空白) を
 /// 同列に並べ、出現順にタイムラインへ積む。
 pub enum MergeInput<'a> {
-    /// リプレイ zip のバイト列。
-    Replay(&'a [u8]),
+    /// リプレイ zip のバイト列と、採用パケットの判定 (None = 全採用)。
+    Replay {
+        bytes: &'a [u8],
+        filter: Option<&'a dyn PacketFilter>,
+    },
     /// 直前までのタイムラインへ加算する空白 (ms)。
     Interval(u64),
 }
@@ -129,7 +143,8 @@ impl ExportSink {
 /// 順序付き入力 (リプレイ zip と interval) を連結して 1 本のリプレイ zip を
 /// 生成する。リストを先頭から走査し、リプレイは現在のオフセットで時刻を積んで
 /// から duration ぶんオフセットを進め、interval はその ms ぶんオフセットを
-/// 進める。行のフィルタはしない。
+/// 進める。各リプレイの [`PacketFilter`] で採用外のパケットは出力から落とす
+/// (duration は元の値のまま使うため、間引いてもタイムラインは詰まらない)。
 ///
 /// interval が位置依存になったため、先頭・連続・末尾の interval もすべて
 /// オフセットへ自然に反映される (末尾 interval は最終 duration を伸ばす)。
@@ -148,7 +163,7 @@ pub async fn export_merged(
     mut on_progress: impl FnMut(ExportProgress),
 ) -> anyhow::Result<Vec<u8>> {
     anyhow::ensure!(
-        items.iter().any(|i| matches!(i, MergeInput::Replay(_))),
+        items.iter().any(|i| matches!(i, MergeInput::Replay { .. })),
         "no input replays"
     );
 
@@ -162,13 +177,13 @@ pub async fn export_merged(
     yield_to_browser().await;
 
     for item in items {
-        let bytes = match item {
+        let (bytes, filter) = match item {
             // interval はオフセットを進めるだけ (イベント処理なし)。
             MergeInput::Interval(ms) => {
                 offset_ms += ms;
                 continue;
             }
-            MergeInput::Replay(bytes) => *bytes,
+            MergeInput::Replay { bytes, filter } => (*bytes, *filter),
         };
         let mut zip = ZipArchiveReader::new(Cursor::new(bytes))?;
         // McprEventSource は reader を借用するため、match の外で生かす
@@ -188,11 +203,18 @@ pub async fn export_merged(
             None => sink.insert(ExportSink::create(format, &info, replay_uuid)?),
         };
 
+        // 採否は入力ごとに 0 起算の index で判定する (表示行 index と一致)。
+        let mut index = 0usize;
         while let Some(mut event) = source.next_event()? {
+            let keep = filter.is_none_or(|f| f.keep(index));
+            index += 1;
             processed += 1;
             if should_yield_progress(processed) {
                 on_progress(ExportProgress::Events { processed });
                 yield_to_browser().await;
+            }
+            if !keep {
+                continue;
             }
             *event.time_mut() = Time::from_millis(event.time().as_millis() + offset_ms);
             sink.as_sink().push(event)?;
@@ -294,6 +316,22 @@ mod tests {
         block_on(export_merged(items, format, replay_uuid, |_| {}))
     }
 
+    /// 全採用 (フィルタなし) の Replay 入力。
+    fn replay(bytes: &[u8]) -> MergeInput<'_> {
+        MergeInput::Replay {
+            bytes,
+            filter: None,
+        }
+    }
+
+    /// 指定 index のパケットだけ出力から落とすテスト用フィルタ。
+    struct DropIndices(Vec<usize>);
+    impl PacketFilter for DropIndices {
+        fn keep(&self, index: usize) -> bool {
+            !self.0.contains(&index)
+        }
+    }
+
     fn packet(time_ms: u64, state: State, id: i32, data: &[u8]) -> Event {
         Event::Packet {
             time: Time::from_millis(time_ms),
@@ -351,12 +389,7 @@ mod tests {
         let events = full_stream(&[100, 250]);
         let input = mcpr_fixture(events.clone(), &info(1000, &[1, 2]));
 
-        let out = export(
-            &[MergeInput::Replay(&input)],
-            ExportFormat::Mcpr,
-            uuid::Uuid::nil(),
-        )
-        .unwrap();
+        let out = export(&[replay(&input)], ExportFormat::Mcpr, uuid::Uuid::nil()).unwrap();
 
         let (out_info, out_events) = read_mcpr(&out);
         assert_eq!(out_events, events);
@@ -374,7 +407,7 @@ mod tests {
         let b = mcpr_fixture(full_stream(&[30]), &info(300, &[]));
 
         let err = export(
-            &[MergeInput::Replay(&a), MergeInput::Replay(&b)],
+            &[replay(&a), replay(&b)],
             ExportFormat::Mcpr,
             uuid::Uuid::nil(),
         )
@@ -383,11 +416,37 @@ mod tests {
     }
 
     #[test]
+    fn packet_filter_drops_unselected_events() {
+        // full_stream = [Login(0), Config(1), Play@100(2), Play@250(3)]。
+        let events = full_stream(&[100, 250]);
+        let input = mcpr_fixture(events.clone(), &info(1000, &[]));
+        // 末尾の Play (index 3) を選択解除して書き出す。
+        let filter = DropIndices(vec![3]);
+
+        let out = block_on(export_merged(
+            &[MergeInput::Replay {
+                bytes: &input,
+                filter: Some(&filter),
+            }],
+            ExportFormat::Mcpr,
+            uuid::Uuid::nil(),
+            |_| {},
+        ))
+        .unwrap();
+
+        let (out_info, out_events) = read_mcpr(&out);
+        // 採用外の行だけが落ち、残りは元のまま。
+        assert_eq!(out_events.as_slice(), &events[..3]);
+        // duration は元の値を維持する (間引いてもタイムラインは詰めない)。
+        assert_eq!(out_info.duration_ms, 1000);
+    }
+
+    #[test]
     fn flashback_output_writes_metadata_and_ticks() {
         let input = mcpr_fixture(full_stream(&[0, 50, 120]), &info(1000, &[]));
 
         let out = export(
-            &[MergeInput::Replay(&input)],
+            &[replay(&input)],
             ExportFormat::Flashback,
             uuid::Uuid::nil(),
         )
@@ -429,7 +488,7 @@ mod tests {
 
         let mut progress = Vec::new();
         block_on(export_merged(
-            &[MergeInput::Replay(&input)],
+            &[replay(&input)],
             ExportFormat::Mcpr,
             uuid::Uuid::nil(),
             |p| progress.push(p),
@@ -471,7 +530,7 @@ mod tests {
         let input = mcpr_fixture(events, &info(1000, &[]));
 
         let out = export(
-            &[MergeInput::Interval(500), MergeInput::Replay(&input)],
+            &[MergeInput::Interval(500), replay(&input)],
             ExportFormat::Mcpr,
             uuid::Uuid::nil(),
         )
@@ -491,7 +550,7 @@ mod tests {
         let input = mcpr_fixture(events, &info(1000, &[]));
 
         let out = export(
-            &[MergeInput::Replay(&input), MergeInput::Interval(500)],
+            &[replay(&input), MergeInput::Interval(500)],
             ExportFormat::Mcpr,
             uuid::Uuid::nil(),
         )
