@@ -11,7 +11,7 @@ use mcpr_lib::{
     mcpr::ReplayReader,
     protocol::parse_packet_id,
 };
-use web_sys::{DragEvent, Event, HtmlInputElement};
+use web_sys::{DragEvent, Event, HtmlDetailsElement, HtmlInputElement};
 use yew::prelude::*;
 
 use crate::{
@@ -455,6 +455,11 @@ pub fn App() -> Html {
     let theme = use_state(initial_theme);
     use_effect_with(*theme, |t| apply_theme(*t));
 
+    // アップロードモーダルの開閉状態。0 件時の「Add files」と Files ヘッダの「+」の両方から開く。
+    let upload_modal_open = use_state(|| false);
+    // Files ヘッダの「+」ドロップダウン。項目クリック後に閉じるため <details> を参照する。
+    let upload_dropdown_ref = use_node_ref();
+
     let on_toggle_theme = {
         let theme = theme.clone();
         Callback::from(move |_: Event| theme.set(theme.toggled()))
@@ -522,6 +527,43 @@ pub fn App() -> Html {
     };
 
     let on_upload_dragover = Callback::from(|e: DragEvent| e.prevent_default());
+
+    let on_open_modal = {
+        let upload_modal_open = upload_modal_open.clone();
+        Callback::from(move |_: MouseEvent| upload_modal_open.set(true))
+    };
+    let on_close_modal = {
+        let upload_modal_open = upload_modal_open.clone();
+        Callback::from(move |_: MouseEvent| upload_modal_open.set(false))
+    };
+    let on_upload_files_item = {
+        let upload_modal_open = upload_modal_open.clone();
+        let upload_dropdown_ref = upload_dropdown_ref.clone();
+        Callback::from(move |_: MouseEvent| {
+            upload_modal_open.set(true);
+            // 項目クリックでは <details> が自動で閉じないため明示的に閉じる。
+            if let Some(d) = upload_dropdown_ref.cast::<HtmlDetailsElement>() {
+                d.set_open(false);
+            }
+        })
+    };
+    // ファイル選択/ドロップ後はモーダルを閉じる (読み込みは非同期に継続)。
+    let on_modal_input_change = {
+        let on_input_change = on_input_change.clone();
+        let upload_modal_open = upload_modal_open.clone();
+        Callback::from(move |e: Event| {
+            on_input_change.emit(e);
+            upload_modal_open.set(false);
+        })
+    };
+    let on_modal_drop = {
+        let on_drop_handler = on_drop_handler.clone();
+        let upload_modal_open = upload_modal_open.clone();
+        Callback::from(move |e: DragEvent| {
+            on_drop_handler.emit(e);
+            upload_modal_open.set(false);
+        })
+    };
 
     let interval_ms: u64 = interval_input.trim().parse().unwrap_or(0);
 
@@ -885,10 +927,8 @@ pub fn App() -> Html {
             </header>
 
             <main class="mcpr-page space-y-6">
-                <section class="mcpr-hero"
-                    ondragover={on_upload_dragover}
-                    ondrop={on_drop_handler}>
-                    <div class="mcpr-hero-body">
+                if files.entries.is_empty() {
+                    <section class="mcpr-empty-state">
                         <div class="space-y-3">
                             <p class="mcpr-eyebrow">{ "REPLAY WORKSPACE" }</p>
                             <h1 class="mcpr-hero-title">{ "Merge Minecraft replay archives." }</h1>
@@ -896,19 +936,12 @@ pub fn App() -> Html {
                                 { "Drop .mcpr or Flashback .zip files, inspect the event stream, then export the merged archive." }
                             </p>
                         </div>
-                        <div class="mcpr-dropzone">
-                            <div class="space-y-1">
-                                <p class="mcpr-eyebrow">{ "INPUT" }</p>
-                                <p class="text-sm text-base-content/70">
-                                    { ".mcpr / Flashback (.zip) ファイルをドロップ (複数可)、またはファイルを選択" }
-                                </p>
-                            </div>
-                            <input type="file" accept=".mcpr,.zip" multiple=true
-                                class="file-input file-input-bordered w-full mcpr-file-input"
-                                onchange={on_input_change} />
-                        </div>
-                    </div>
-                </section>
+                        <button type="button" class="btn mcpr-btn mcpr-btn-primary"
+                            onclick={on_open_modal.clone()}>
+                            { "+ ファイルを追加" }
+                        </button>
+                    </section>
+                }
 
                 if !files.entries.is_empty() {
                     <section class="mcpr-workspace">
@@ -920,6 +953,19 @@ pub fn App() -> Html {
                                             { "Files" }
                                             <span class="mcpr-badge">{ files.entries.len() }</span>
                                         </h2>
+                                        <details class="dropdown dropdown-end" ref={upload_dropdown_ref.clone()}>
+                                            <summary class="mcpr-icon-button"
+                                                aria-label="ファイルを追加" title="ファイルを追加">
+                                                { "+" }
+                                            </summary>
+                                            <ul class="dropdown-content menu mcpr-dropdown-menu">
+                                                <li>
+                                                    <button type="button" onclick={on_upload_files_item}>
+                                                        { "Upload Files" }
+                                                    </button>
+                                                </li>
+                                            </ul>
+                                        </details>
                                     </div>
                                     <ul class="mcpr-file-list">{ file_rows }</ul>
                                     { merge_settings }
@@ -951,6 +997,34 @@ pub fn App() -> Html {
                         </div>
                     </section>
                 }
+
+                <div class={classes!("modal", upload_modal_open.then_some("modal-open"))}
+                    role="dialog" aria-modal="true">
+                    <div class="modal-box mcpr-upload-modal-box">
+                        <div class="mcpr-section-header">
+                            <h3 class="mcpr-section-title">{ "ファイルを追加" }</h3>
+                            <button type="button" class="mcpr-icon-button"
+                                aria-label="閉じる" title="閉じる" onclick={on_close_modal.clone()}>
+                                { "✕" }
+                            </button>
+                        </div>
+                        <div class="mcpr-dropzone mcpr-modal-dropzone"
+                            ondragover={on_upload_dragover}
+                            ondrop={on_modal_drop}>
+                            <div class="space-y-1">
+                                <p class="mcpr-eyebrow">{ "INPUT" }</p>
+                                <p class="text-sm text-base-content/70">
+                                    { ".mcpr / Flashback (.zip) ファイルをドロップ (複数可)、またはファイルを選択" }
+                                </p>
+                            </div>
+                            <input type="file" accept=".mcpr,.zip" multiple=true
+                                class="file-input file-input-bordered w-full mcpr-file-input"
+                                onchange={on_modal_input_change} />
+                        </div>
+                    </div>
+                    // 背景クリックで閉じる
+                    <div class="modal-backdrop" onclick={on_close_modal}></div>
+                </div>
             </main>
         </div>
     }

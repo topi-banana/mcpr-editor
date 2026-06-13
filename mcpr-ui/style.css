@@ -214,35 +214,15 @@
     padding: 64px 24px 96px;
   }
 
-  .mcpr-hero {
-    position: relative;
-    overflow: hidden;
+  .mcpr-empty-state {
+    display: grid;
+    justify-items: center;
+    gap: 24px;
+    text-align: center;
+    padding: 64px 24px;
     border-radius: 16px;
     background: var(--mcpr-canvas);
     box-shadow: var(--mcpr-shadow-4);
-  }
-
-  .mcpr-hero::before {
-    position: absolute;
-    inset: -45% -20% auto;
-    height: 360px;
-    content: "";
-    background:
-      radial-gradient(circle at 18% 42%, var(--mcpr-gradient-develop-start), transparent 28%),
-      radial-gradient(circle at 42% 38%, var(--mcpr-gradient-develop-end), transparent 24%),
-      radial-gradient(circle at 58% 34%, var(--mcpr-gradient-preview-start), transparent 24%),
-      radial-gradient(circle at 74% 44%, var(--mcpr-gradient-preview-end), transparent 26%),
-      radial-gradient(circle at 86% 58%, var(--mcpr-gradient-ship-end), transparent 25%);
-    filter: blur(24px);
-    opacity: 0.72;
-    pointer-events: none;
-  }
-
-  .mcpr-hero-body {
-    position: relative;
-    display: grid;
-    gap: 24px;
-    padding: 48px;
   }
 
   .mcpr-eyebrow {
@@ -704,6 +684,36 @@
     font-size: 13px;
     line-height: 20px;
   }
+
+  /* <summary> の三角マーカーを消す */
+  .dropdown > summary.mcpr-icon-button {
+    list-style: none;
+    cursor: pointer;
+  }
+
+  .dropdown > summary.mcpr-icon-button::-webkit-details-marker {
+    display: none;
+  }
+
+  .mcpr-dropdown-menu {
+    z-index: 50;
+    margin-top: 6px;
+    min-width: 180px;
+    border: 1px solid var(--mcpr-hairline);
+    border-radius: 12px;
+    background: var(--mcpr-canvas);
+    box-shadow: var(--mcpr-shadow-3);
+    padding: 6px;
+  }
+
+  .mcpr-upload-modal-box {
+    display: grid;
+    gap: 16px;
+  }
+
+  .mcpr-modal-dropzone {
+    min-height: 140px;
+  }
 }
 
 @media (max-width: 720px) {
@@ -719,11 +729,8 @@
     padding: 32px 16px 64px;
   }
 
-  .mcpr-hero {
+  .mcpr-empty-state {
     border-radius: 12px;
-  }
-
-  .mcpr-hero-body {
     padding: 32px 20px;
   }
 
