@@ -970,18 +970,22 @@ pub fn App() -> Html {
         })
     };
 
+    // 出力フォーマットの 2 択。選択中・非選択がひと目で分かるよう、トラックで
+    // 囲んだセグメンテッドコントロールにし、選択中セグメントへチェックを付ける
+    // (チェック枠は両セグメントに常設し、切り替えで幅がずれないようにする)。
     let format_buttons = ExportFormat::ORDER
         .iter()
         .map(|&f| {
             let export_format = export_format.clone();
-            let class = if *export_format == f {
-                "btn btn-sm join-item mcpr-btn mcpr-btn-primary"
-            } else {
-                "btn btn-sm join-item mcpr-btn mcpr-btn-secondary"
-            };
+            let is_active = *export_format == f;
             html! {
-                <button key={f.extension()} class={class}
+                <button key={f.extension()} type="button"
+                    class={classes!("mcpr-segment", is_active.then_some("is-active"))}
+                    aria-pressed={is_active.to_string()}
                     onclick={Callback::from(move |_| export_format.set(f))}>
+                    <span class="mcpr-segment-check" aria-hidden="true">
+                        { if is_active { "✓" } else { "" } }
+                    </span>
                     { f.label() }
                 </button>
             }
@@ -1026,7 +1030,9 @@ pub fn App() -> Html {
     // 書き出し行。1 件でも意味がある (フォーマット変換 = CLI の単一入力動作)。
     let export_row = html! {
         <div class="mcpr-divider-row mcpr-export-row text-sm">
-            <div class="join">{ format_buttons }</div>
+            <div class="mcpr-segmented" role="group" aria-label="出力フォーマット">
+                { format_buttons }
+            </div>
             { progress_view }
             <button class="btn btn-sm mcpr-btn mcpr-btn-primary"
                 disabled={!all_loaded || export_phase.is_some()}

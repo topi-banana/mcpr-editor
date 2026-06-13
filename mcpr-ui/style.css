@@ -587,6 +587,59 @@
     background: var(--mcpr-canvas-soft-2);
   }
 
+  /* 出力フォーマットのセグメンテッドコントロール。トラックで 2 択を 1 つの
+     コントロールとして囲み、選択中だけ ink 塗り + チェックで明示する
+     (隣の Export アクションボタンと取り違えないようにする)。 */
+  .mcpr-segmented {
+    display: inline-flex;
+    padding: 3px;
+    gap: 3px;
+    border-radius: 100px;
+    border: 1px solid var(--mcpr-hairline);
+    background: var(--mcpr-canvas-soft-2);
+  }
+
+  .mcpr-segment {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex: 1 1 0;
+    min-height: 28px;
+    padding: 0 14px;
+    border: 0;
+    border-radius: 100px;
+    background: transparent;
+    color: var(--mcpr-muted);
+    font-size: 14px;
+    font-weight: 500;
+    line-height: 20px;
+    white-space: nowrap;
+    cursor: pointer;
+    transition:
+      background 0.15s ease,
+      color 0.15s ease;
+  }
+
+  .mcpr-segment:hover:not(.is-active) {
+    color: var(--mcpr-ink);
+    background: color-mix(in srgb, var(--mcpr-ink) 8%, transparent);
+  }
+
+  .mcpr-segment.is-active {
+    background: var(--mcpr-ink);
+    color: var(--mcpr-on-ink);
+    font-weight: 600;
+  }
+
+  /* チェック枠は両セグメントに常設し、選択切り替えで文字幅がずれないようにする。 */
+  .mcpr-segment-check {
+    display: inline-block;
+    width: 0.9em;
+    margin-right: 4px;
+    text-align: center;
+    font-size: 12px;
+  }
+
   .mcpr-btn-danger {
     border-color: transparent;
     background: var(--mcpr-error-soft);
