@@ -415,6 +415,21 @@ impl PacketSelection {
         self.flipped.clear();
     }
 
+    /// 指定した複数件をまとめて `on` に揃える (ドラッグ範囲選択の一括 On/Off)。
+    /// 採否は `base ^ flipped.contains` なので、`on == base` の側は flipped から
+    /// 外し、反対側は flipped に入れるだけで済む。
+    fn set_many(&mut self, indices: &HashSet<usize>, on: bool) {
+        if on == self.base {
+            for i in indices {
+                self.flipped.remove(i);
+            }
+        } else {
+            for &i in indices {
+                self.flipped.insert(i);
+            }
+        }
+    }
+
     /// 採用件数 (`total` は対象ファイルの全イベント数)。
     fn on_count(&self, total: usize) -> usize {
         if self.base {
@@ -443,6 +458,12 @@ enum SelectionAction {
     Toggle { file_id: u64, index: usize },
     /// 対象ファイルの全パケットを一括採否。
     SetAll { file_id: u64, on: bool },
+    /// ドラッグ範囲選択した複数パケットをまとめて採否。
+    SetMany {
+        file_id: u64,
+        indices: Rc<HashSet<usize>>,
+        on: bool,
+    },
     /// ファイル削除時に選択も捨てる。
     Remove { file_id: u64 },
 }
@@ -466,6 +487,17 @@ impl Reducible for SelectionState {
                     .get(&file_id)
                     .map_or_else(PacketSelection::default, |s| (**s).clone());
                 sel.set_all(on);
+                by_file.insert(file_id, Rc::new(sel));
+            }
+            SelectionAction::SetMany {
+                file_id,
+                indices,
+                on,
+            } => {
+                let mut sel = by_file
+                    .get(&file_id)
+                    .map_or_else(PacketSelection::default, |s| (**s).clone());
+                sel.set_many(&indices, on);
                 by_file.insert(file_id, Rc::new(sel));
             }
             SelectionAction::Remove { file_id } => {
@@ -1190,6 +1222,18 @@ pub fn App() -> Html {
             selection_dispatch.dispatch(SelectionAction::SetAll { file_id, on });
         })
     };
+    let on_set_many_packets = {
+        let selection_dispatch = selection.dispatcher();
+        Callback::from(
+            move |(file_id, indices, on): (u64, Rc<HashSet<usize>>, bool)| {
+                selection_dispatch.dispatch(SelectionAction::SetMany {
+                    file_id,
+                    indices,
+                    on,
+                });
+            },
+        )
+    };
 
     html! {
         <div class="mcpr-shell">
@@ -1286,6 +1330,7 @@ pub fn App() -> Html {
                                     selection={loaded_selection.clone()}
                                     on_toggle={on_toggle_packet.clone()}
                                     on_set_all={on_set_all_packets.clone()}
+                                    on_set_many={on_set_many_packets.clone()}
                                     on_remove={on_remove_file.clone()} />
                             } else {
                                 <section class="mcpr-panel">
@@ -1373,6 +1418,8 @@ struct LoadedViewProps {
     on_toggle: Callback<(u64, usize)>,
     /// (file_id, on) で全件を一括採否。
     on_set_all: Callback<(u64, bool)>,
+    /// (file_id, 元 index 集合, on) でドラッグ範囲選択した複数件をまとめて採否。
+    on_set_many: Callback<(u64, Rc<HashSet<usize>>, bool)>,
     on_remove: Callback<u64>,
 }
 
@@ -1403,6 +1450,11 @@ fn LoadedView(props: &LoadedViewProps) -> Html {
     let sort = use_state(|| Option::<(SortKey, SortDir)>::None);
     // 全選択チェックボックスの中間状態 (indeterminate) は属性に無く DOM 直設定が要る。
     let header_check_ref = use_node_ref();
+    // 行のドラッグ範囲選択。`mark_anchor` はドラッグ開始行のページ内位置 (押下中のみ
+    // Some)、`marked` は選択済みの元 index 集合で、一括 On/Off の対象とハイライト表示に
+    // 使う。export 採否 (`PacketSelection`) とは別概念の、UI だけの一時状態。
+    let mark_anchor = use_state(|| Option::<usize>::None);
+    let marked = use_state(|| Rc::new(HashSet::<usize>::new()));
 
     // 表示する行の元 index 列 (None = 全行を記録順のまま)。
     // filter / sort / events が変わった時だけ全行を走査する。
@@ -1442,6 +1494,13 @@ fn LoadedView(props: &LoadedViewProps) -> Html {
     let cur_page = (*page).min(total_pages - 1);
     let start = cur_page * PAGE_SIZE;
     let end = (start + PAGE_SIZE).min(shown);
+
+    // 現在ページの各表示位置 (0 始まり) → 元 index。ドラッグ範囲を元 index へ写すのに使う。
+    let page_orig: Rc<Vec<usize>> = Rc::new(
+        (start..end)
+            .map(|pos| indices.as_ref().map_or(pos, |v| v[pos]))
+            .collect(),
+    );
 
     // パケット採否の集計 (全選択チェックボックスとカウント表示用)。
     let selected_count = props.selection.on_count(total_all);
@@ -1565,15 +1624,85 @@ fn LoadedView(props: &LoadedViewProps) -> Html {
         Callback::from(move |_: Event| on_set_all.emit((id, !all_selected)))
     };
 
-    let rows = (start..end)
-        .map(|pos| {
-            let orig = indices.as_ref().map_or(pos, |v| v[pos]);
+    // ドラッグの終了 (マウスアップ)。アンカーを外せば以後の hover で範囲が伸びない。
+    let on_mark_up = {
+        let mark_anchor = mark_anchor.clone();
+        Callback::from(move |_: MouseEvent| mark_anchor.set(None))
+    };
+    let on_clear_marks = {
+        let mark_anchor = mark_anchor.clone();
+        let marked = marked.clone();
+        Callback::from(move |_: MouseEvent| {
+            mark_anchor.set(None);
+            marked.set(Rc::new(HashSet::new()));
+        })
+    };
+    let on_mark_on = {
+        let on_set_many = props.on_set_many.clone();
+        let marked = marked.clone();
+        let id = props.id;
+        Callback::from(move |_: MouseEvent| {
+            if !marked.is_empty() {
+                on_set_many.emit((id, (*marked).clone(), true));
+            }
+        })
+    };
+    let on_mark_off = {
+        let on_set_many = props.on_set_many.clone();
+        let marked = marked.clone();
+        let id = props.id;
+        Callback::from(move |_: MouseEvent| {
+            if !marked.is_empty() {
+                on_set_many.emit((id, (*marked).clone(), false));
+            }
+        })
+    };
+
+    let rows = (0..page_orig.len())
+        .map(|pi| {
+            let orig = page_orig[pi];
             let row = &all[orig];
             let checked = props.selection.is_on(orig);
+            let is_marked = marked.contains(&orig);
             let on_check = {
                 let on_toggle = props.on_toggle.clone();
                 let id = props.id;
                 Callback::from(move |_: Event| on_toggle.emit((id, orig)))
+            };
+            // 行本体の押下でドラッグ範囲選択を開始 (その行だけを選択状態にする)。
+            // 既定のテキスト選択は prevent_default で抑止する。
+            let on_row_down = {
+                let mark_anchor = mark_anchor.clone();
+                let marked = marked.clone();
+                Callback::from(move |e: MouseEvent| {
+                    e.prevent_default();
+                    mark_anchor.set(Some(pi));
+                    marked.set(Rc::new(HashSet::from([orig])));
+                })
+            };
+            // ドラッグ中に別の行へ入ったら、アンカーからその行までを選択し直す。
+            // マウスアップを取りこぼした後の hover で誤って伸びないよう、主ボタンの
+            // 保持を `buttons` で確認し、離れていればドラッグを終了する。
+            let on_row_enter = {
+                let mark_anchor = mark_anchor.clone();
+                let marked = marked.clone();
+                let page_orig = page_orig.clone();
+                Callback::from(move |e: MouseEvent| {
+                    let Some(anchor) = *mark_anchor else {
+                        return;
+                    };
+                    if e.buttons() & 1 == 0 {
+                        mark_anchor.set(None);
+                        return;
+                    }
+                    let (lo, hi) = if anchor <= pi {
+                        (anchor, pi)
+                    } else {
+                        (pi, anchor)
+                    };
+                    let set: HashSet<usize> = page_orig[lo..=hi].iter().copied().collect();
+                    marked.set(Rc::new(set));
+                })
             };
             let (event, state) = match &row.kind {
                 RowKind::Packet { id, state } => (
@@ -1587,8 +1716,15 @@ fn LoadedView(props: &LoadedViewProps) -> Html {
                 ),
             };
             html! {
-                <tr class={classes!((!checked).then_some("is-excluded"))}>
-                    <td class="mcpr-check-cell">
+                <tr class={classes!(
+                        (!checked).then_some("is-excluded"),
+                        is_marked.then_some("is-selected"),
+                    )}
+                    onmousedown={on_row_down}
+                    onmouseenter={on_row_enter}>
+                    // チェックボックス操作は行ドラッグと衝突するため、押下を行へ伝播させない。
+                    <td class="mcpr-check-cell"
+                        onmousedown={Callback::from(|e: MouseEvent| e.stop_propagation())}>
                         <input type="checkbox" class="checkbox checkbox-sm mcpr-row-check"
                             checked={checked} onchange={on_check}
                             aria-label="このパケットを書き出しに含める" />
@@ -1668,7 +1804,31 @@ fn LoadedView(props: &LoadedViewProps) -> Html {
                             value={filter.query.clone()}
                             oninput={on_query} />
                     </div>
-                    <div class="mcpr-table-wrap">
+                    <div class="mcpr-bulk-bar">
+                        <span class="mcpr-muted text-xs">
+                            { if marked.is_empty() {
+                                "行をドラッグして範囲選択 → まとめて On / Off".to_string()
+                            } else {
+                                format!("{} 行を選択中", marked.len())
+                            } }
+                        </span>
+                        <div class="join">
+                            <button type="button" class="btn btn-sm join-item mcpr-btn mcpr-btn-primary"
+                                disabled={marked.is_empty()} onclick={on_mark_on}>
+                                { "On" }
+                            </button>
+                            <button type="button" class="btn btn-sm join-item mcpr-btn mcpr-btn-secondary"
+                                disabled={marked.is_empty()} onclick={on_mark_off}>
+                                { "Off" }
+                            </button>
+                        </div>
+                        <button type="button" class="btn btn-sm mcpr-btn mcpr-btn-secondary"
+                            disabled={marked.is_empty()} onclick={on_clear_marks}>
+                            { "選択解除" }
+                        </button>
+                    </div>
+                    <div class={classes!("mcpr-table-wrap", mark_anchor.is_some().then_some("is-selecting"))}
+                        onmouseup={on_mark_up}>
                         <table class="mcpr-table">
                             <thead>
                                 <tr>
@@ -1808,6 +1968,37 @@ mod tests {
             })
             .collect();
         assert_eq!(inputs, vec![None, Some("1200")]);
+    }
+
+    #[test]
+    fn set_many_flips_only_listed_indices_to_target() {
+        // 既定 (全採用) から一部を Off にし、別の集合を On に戻す。
+        let mut sel = PacketSelection::default();
+        sel.set_many(&HashSet::from([1, 3, 5]), false);
+        assert!(sel.is_on(0));
+        assert!(!sel.is_on(1));
+        assert!(!sel.is_on(3));
+        assert!(!sel.is_on(5));
+        assert_eq!(sel.on_count(6), 3);
+
+        // 3 と 5 を On に戻すと 1 だけ Off のまま。
+        sel.set_many(&HashSet::from([3, 5]), true);
+        assert!(sel.is_on(3));
+        assert!(sel.is_on(5));
+        assert!(!sel.is_on(1));
+        assert_eq!(sel.on_count(6), 5);
+    }
+
+    #[test]
+    fn set_many_on_after_set_all_off_selects_listed() {
+        // 全 Off の土台 (base=false) から指定だけ On にする。
+        let mut sel = PacketSelection::default();
+        sel.set_all(false);
+        sel.set_many(&HashSet::from([2, 4]), true);
+        assert!(sel.is_on(2));
+        assert!(sel.is_on(4));
+        assert!(!sel.is_on(0));
+        assert_eq!(sel.on_count(5), 2);
     }
 
     #[test]

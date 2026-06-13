@@ -808,6 +808,28 @@
     opacity: 0.4;
   }
 
+  /* ドラッグで範囲選択中の行 (nth-child の縞より優先させるため td に塗る) */
+  .mcpr-table tbody tr.is-selected td {
+    background: color-mix(in srgb, var(--mcpr-link) 16%, var(--mcpr-canvas));
+  }
+
+  .mcpr-table tbody tr.is-selected td:first-child {
+    box-shadow: inset 3px 0 0 var(--mcpr-link);
+  }
+
+  /* 範囲選択ドラッグ中はテキスト選択を抑止する */
+  .mcpr-table-wrap.is-selecting {
+    user-select: none;
+  }
+
+  /* 範囲選択した行をまとめて On/Off する操作バー */
+  .mcpr-bulk-bar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+
   /* <summary> の三角マーカーを消す */
   .dropdown > summary.mcpr-icon-button {
     list-style: none;
