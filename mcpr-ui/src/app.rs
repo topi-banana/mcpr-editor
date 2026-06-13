@@ -959,8 +959,7 @@ pub fn App() -> Html {
                         }));
                     }
                 };
-                let result =
-                    export_merged(&items, format, new_replay_uuid(), on_progress).await;
+                let result = export_merged(&items, format, new_replay_uuid(), on_progress).await;
                 match result {
                     Ok(bytes) => trigger_download(&bytes, &filename),
                     Err(e) => export_error.set(Some(format!("export error: {e}"))),
