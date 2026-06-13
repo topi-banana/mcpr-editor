@@ -436,6 +436,8 @@ pub fn App() -> Html {
     let selected_file_id = use_state(|| Option::<u64>::None);
     let dragging_file_id = use_state(|| Option::<u64>::None);
     let drop_target_file_id = use_state(|| Option::<u64>::None);
+    // ドロップ直後に着地した行を一瞬ハイライトする (タイマーで自動解除)。
+    let just_moved_file_id = use_state(|| Option::<u64>::None);
     // 読み込み中の FileReader を id 別に保持。remove で drop され読み込みは中断される。
     let readers = use_mut_ref(HashMap::<u64, FileReader>::new);
     // FileEntry::id の発番カウンタ。
@@ -564,6 +566,7 @@ pub fn App() -> Html {
             let is_active = active_file_id == Some(id);
             let is_dragging = *dragging_file_id == Some(id);
             let is_drop_target = *drop_target_file_id == Some(id) && !is_dragging;
+            let is_just_moved = *just_moved_file_id == Some(id);
             let select = {
                 let selected_file_id = selected_file_id.clone();
                 Callback::from(move |_| {
@@ -598,6 +601,7 @@ pub fn App() -> Html {
                 let dispatch = files.dispatcher();
                 let dragging_file_id = dragging_file_id.clone();
                 let drop_target_file_id = drop_target_file_id.clone();
+                let just_moved_file_id = just_moved_file_id.clone();
                 Callback::from(move |e: DragEvent| {
                     e.prevent_default();
                     e.stop_propagation();
@@ -606,10 +610,20 @@ pub fn App() -> Html {
                             .and_then(|dt| dt.get_data("text/plain").ok())
                             .and_then(|id| id.parse::<u64>().ok())
                     });
-                    if let Some(dragged_id) = dragged_id {
+                    if let Some(dragged_id) = dragged_id
+                        && dragged_id != id
+                    {
                         dispatch.dispatch(FilesAction::Reorder {
                             dragged_id,
                             target_id: id,
+                        });
+                        // 移動した行を着地ハイライト。CSS アニメーションを次回も
+                        // 再生させるため、再生時間ぶん待ってから解除する。
+                        just_moved_file_id.set(Some(dragged_id));
+                        let just_moved_file_id = just_moved_file_id.clone();
+                        yew::platform::spawn_local(async move {
+                            gloo_timers::future::TimeoutFuture::new(450).await;
+                            just_moved_file_id.set(None);
                         });
                     }
                     dragging_file_id.set(None);
@@ -647,6 +661,7 @@ pub fn App() -> Html {
                     (!is_loaded).then_some("is-unavailable"),
                     is_dragging.then_some("is-dragging"),
                     is_drop_target.then_some("is-drop-target"),
+                    is_just_moved.then_some("is-just-moved"),
                 )}>
                     <button type="button" class="mcpr-file-tab"
                         draggable="true"

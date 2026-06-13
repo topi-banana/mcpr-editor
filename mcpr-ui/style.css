@@ -399,6 +399,7 @@
       border-color 120ms ease,
       background-color 120ms ease,
       box-shadow 120ms ease,
+      transform 160ms cubic-bezier(0.2, 0, 0, 1),
       opacity 120ms ease;
     width: 100%;
   }
@@ -415,7 +416,13 @@
 
   .mcpr-file-tab-row.is-dragging .mcpr-file-tab {
     cursor: grabbing;
-    opacity: 0.56;
+    opacity: 0.4;
+    /* 抜き取った後の「穴 (プレースホルダ)」に見せる。 */
+    transform: scale(0.97);
+    border-style: dashed;
+    border-color: var(--mcpr-hairline-strong);
+    background: var(--mcpr-canvas-soft);
+    box-shadow: none;
   }
 
   .mcpr-file-tab-row.is-active .mcpr-file-tab {
@@ -425,9 +432,55 @@
   }
 
   .mcpr-file-tab-row.is-drop-target .mcpr-file-tab {
+    /* 「ここに入る」を破線枠＋わずかな拡大＋パルスで明示。 */
+    border-style: dashed;
     border-color: var(--mcpr-link);
-    background: color-mix(in srgb, var(--mcpr-link) 8%, var(--mcpr-canvas));
-    box-shadow: inset 3px 0 0 var(--mcpr-link);
+    background: color-mix(in srgb, var(--mcpr-link) 10%, var(--mcpr-canvas));
+    transform: scale(1.02);
+    animation: mcpr-drop-pulse 1100ms ease-in-out infinite;
+  }
+
+  @keyframes mcpr-drop-pulse {
+    0%,
+    100% {
+      box-shadow:
+        inset 3px 0 0 var(--mcpr-link),
+        0 0 0 1px color-mix(in srgb, var(--mcpr-link) 30%, transparent);
+    }
+    50% {
+      box-shadow:
+        inset 3px 0 0 var(--mcpr-link),
+        0 0 0 4px color-mix(in srgb, var(--mcpr-link) 20%, transparent);
+    }
+  }
+
+  /* ドロップ完了直後、移動した行を一瞬光らせて着地先を示す。 */
+  .mcpr-file-tab-row.is-just-moved .mcpr-file-tab {
+    animation: mcpr-land 450ms ease-out;
+  }
+
+  @keyframes mcpr-land {
+    0% {
+      background: color-mix(in srgb, var(--mcpr-link) 24%, var(--mcpr-canvas));
+      box-shadow: 0 0 0 2px color-mix(in srgb, var(--mcpr-link) 55%, transparent);
+    }
+    100% {
+      background: var(--mcpr-canvas-soft);
+      box-shadow: none;
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .mcpr-file-tab {
+      transition: border-color 120ms ease, background-color 120ms ease;
+    }
+
+    .mcpr-file-tab-row.is-dragging .mcpr-file-tab,
+    .mcpr-file-tab-row.is-drop-target .mcpr-file-tab,
+    .mcpr-file-tab-row.is-just-moved .mcpr-file-tab {
+      transform: none;
+      animation: none;
+    }
   }
 
   .mcpr-file-tab .mcpr-file-status {
