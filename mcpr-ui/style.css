@@ -6,3 +6,869 @@
 @plugin "./daisyui.mjs" {
   themes: light --default, dark --prefersdark;
 }
+
+:root {
+  color-scheme: light;
+  --mcpr-ink: #171717;
+  --mcpr-on-ink: #ffffff;
+  --mcpr-body: #4d4d4d;
+  --mcpr-muted: #888888;
+  --mcpr-hairline: #ebebeb;
+  --mcpr-hairline-strong: #a1a1a1;
+  --mcpr-canvas: #ffffff;
+  --mcpr-canvas-soft: #fafafa;
+  --mcpr-canvas-soft-2: #f5f5f5;
+  --mcpr-link: #0070f3;
+  --mcpr-link-deep: #0761d1;
+  --mcpr-error: #ee0000;
+  --mcpr-error-soft: #f7d4d6;
+  --mcpr-gradient-develop-start: #007cf0;
+  --mcpr-gradient-develop-end: #00dfd8;
+  --mcpr-gradient-preview-start: #7928ca;
+  --mcpr-gradient-preview-end: #ff0080;
+  --mcpr-gradient-ship-start: #ff4d4d;
+  --mcpr-gradient-ship-end: #f9cb28;
+  --mcpr-shadow-1: inset 0 0 0 1px #00000014;
+  --mcpr-shadow-2:
+    0 1px 1px #00000005,
+    0 2px 2px #0000000a,
+    inset 0 0 0 1px #00000014;
+  --mcpr-shadow-3:
+    0 2px 2px #0000000a,
+    0 8px 8px -8px #0000000a,
+    inset 0 0 0 1px #00000014;
+  --mcpr-shadow-4:
+    0 2px 2px #0000000a,
+    0 8px 16px -4px #0000000a,
+    inset 0 0 0 1px #00000014;
+  --font-sans: Geist, Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-mono: "Geist Mono", "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  --color-base-100: var(--mcpr-canvas);
+  --color-base-200: var(--mcpr-canvas-soft);
+  --color-base-300: var(--mcpr-hairline);
+  --color-base-content: var(--mcpr-ink);
+  --color-primary: var(--mcpr-ink);
+  --color-primary-content: var(--mcpr-on-ink);
+  --color-error: var(--mcpr-error);
+  --color-error-content: var(--mcpr-on-ink);
+  --radius-box: 8px;
+  --radius-field: 6px;
+  --radius-selector: 100px;
+  --border: 1px;
+}
+
+[data-theme="dark"] {
+  color-scheme: dark;
+  --mcpr-ink: #f5f5f5;
+  --mcpr-on-ink: #171717;
+  --mcpr-body: #d4d4d4;
+  --mcpr-muted: #888888;
+  --mcpr-hairline: #2a2a2a;
+  --mcpr-hairline-strong: #525252;
+  --mcpr-canvas: #111111;
+  --mcpr-canvas-soft: #090909;
+  --mcpr-canvas-soft-2: #171717;
+  --mcpr-link: #3291ff;
+  --mcpr-link-deep: #0070f3;
+  --mcpr-error-soft: #3b1113;
+  --mcpr-shadow-1: inset 0 0 0 1px #ffffff1a;
+  --mcpr-shadow-2:
+    0 1px 1px #00000040,
+    0 2px 2px #0000004d,
+    inset 0 0 0 1px #ffffff1a;
+  --mcpr-shadow-3:
+    0 2px 2px #00000040,
+    0 8px 8px -8px #00000073,
+    inset 0 0 0 1px #ffffff1a;
+  --mcpr-shadow-4:
+    0 2px 2px #00000040,
+    0 8px 16px -4px #00000073,
+    inset 0 0 0 1px #ffffff1a;
+  --color-base-100: var(--mcpr-canvas);
+  --color-base-200: var(--mcpr-canvas-soft);
+  --color-base-300: var(--mcpr-hairline);
+  --color-base-content: var(--mcpr-ink);
+  --color-primary: var(--mcpr-ink);
+  --color-primary-content: var(--mcpr-on-ink);
+}
+
+@layer base {
+  html {
+    background: var(--mcpr-canvas-soft);
+    color: var(--mcpr-ink);
+    font-family: var(--font-sans);
+    font-feature-settings: "ss01", "ss02";
+    letter-spacing: 0;
+  }
+
+  body {
+    min-height: 100vh;
+    background: var(--mcpr-canvas-soft);
+  }
+
+  code,
+  pre,
+  kbd,
+  samp {
+    font-family: var(--font-mono);
+  }
+
+  ::selection {
+    background: var(--mcpr-ink);
+    color: var(--mcpr-on-ink);
+  }
+}
+
+@layer components {
+  .mcpr-shell {
+    min-height: 100vh;
+    background:
+      radial-gradient(circle at 48% 0%, color-mix(in srgb, var(--mcpr-gradient-develop-start) 22%, transparent) 0, transparent 22rem),
+      radial-gradient(circle at 64% 2rem, color-mix(in srgb, var(--mcpr-gradient-preview-end) 18%, transparent) 0, transparent 20rem),
+      linear-gradient(180deg, var(--mcpr-canvas) 0, var(--mcpr-canvas-soft) 28rem);
+    color: var(--mcpr-ink);
+  }
+
+  .mcpr-topbar {
+    position: sticky;
+    top: 0;
+    z-index: 20;
+    height: 64px;
+    border-bottom: 1px solid var(--mcpr-hairline);
+    background: color-mix(in srgb, var(--mcpr-canvas) 88%, transparent);
+    backdrop-filter: saturate(180%) blur(12px);
+  }
+
+  .mcpr-topbar-inner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 24px;
+    width: min(100%, 1400px);
+    height: 100%;
+    margin: 0 auto;
+    padding: 0 24px;
+  }
+
+  .mcpr-brand {
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    color: var(--mcpr-ink);
+    font-size: 14px;
+    font-weight: 600;
+    line-height: 20px;
+    letter-spacing: -0.28px;
+  }
+
+  .mcpr-logo-mark {
+    width: 0;
+    height: 0;
+    border-right: 9px solid transparent;
+    border-bottom: 16px solid var(--mcpr-ink);
+    border-left: 9px solid transparent;
+  }
+
+  .mcpr-nav-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .mcpr-nav-link {
+    border-radius: 9999px;
+    color: var(--mcpr-body);
+    font-size: 14px;
+    line-height: 20px;
+    letter-spacing: -0.28px;
+    padding: 6px 12px;
+  }
+
+  .mcpr-nav-link:hover {
+    background: var(--mcpr-canvas-soft-2);
+    color: var(--mcpr-ink);
+    text-decoration: none;
+  }
+
+  .mcpr-icon-button {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 32px;
+    height: 32px;
+    min-height: 32px;
+    border: 1px solid var(--mcpr-hairline);
+    border-radius: 9999px;
+    background: var(--mcpr-canvas);
+    color: var(--mcpr-ink);
+  }
+
+  .mcpr-icon-button:hover {
+    border-color: var(--mcpr-hairline-strong);
+    background: var(--mcpr-canvas-soft-2);
+  }
+
+  .mcpr-page {
+    width: min(100%, 1400px);
+    margin: 0 auto;
+    padding: 64px 24px 96px;
+  }
+
+  .mcpr-empty-state {
+    display: grid;
+    justify-items: center;
+    gap: 24px;
+    text-align: center;
+    padding: 64px 24px;
+    border-radius: 16px;
+    background: var(--mcpr-canvas);
+    box-shadow: var(--mcpr-shadow-4);
+  }
+
+  .mcpr-eyebrow {
+    color: var(--mcpr-muted);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    font-weight: 400;
+    line-height: 16px;
+  }
+
+  .mcpr-hero-title {
+    max-width: 720px;
+    color: var(--mcpr-ink);
+    font-size: 48px;
+    font-weight: 600;
+    line-height: 48px;
+    letter-spacing: -2.4px;
+  }
+
+  .mcpr-hero-copy {
+    max-width: 660px;
+    color: var(--mcpr-body);
+    font-size: 18px;
+    font-weight: 400;
+    line-height: 28px;
+    letter-spacing: 0;
+  }
+
+  .mcpr-dropzone {
+    display: grid;
+    gap: 16px;
+    align-items: center;
+    min-height: 168px;
+    padding: 24px;
+    border: 1px dashed var(--mcpr-hairline-strong);
+    border-radius: 12px;
+    background: color-mix(in srgb, var(--mcpr-canvas) 82%, transparent);
+  }
+
+  .mcpr-file-input {
+    --btn-color: var(--mcpr-ink);
+    max-width: 360px;
+    border-radius: 100px;
+    border-color: var(--mcpr-hairline);
+    background: var(--mcpr-canvas);
+    color: var(--mcpr-ink);
+    font-size: 14px;
+  }
+
+  .mcpr-panel {
+    border-radius: 12px;
+    background: var(--mcpr-canvas);
+    color: var(--mcpr-ink);
+    box-shadow: var(--mcpr-shadow-3);
+  }
+
+  .mcpr-panel-body {
+    display: grid;
+    gap: 16px;
+    padding: 24px;
+  }
+
+  .mcpr-section-header {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+  }
+
+  .mcpr-section-title {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    color: var(--mcpr-ink);
+    font-size: 24px;
+    font-weight: 600;
+    line-height: 32px;
+    letter-spacing: -0.96px;
+  }
+
+  .mcpr-badge {
+    display: inline-flex;
+    align-items: center;
+    min-height: 22px;
+    border: 1px solid var(--mcpr-hairline);
+    border-radius: 9999px;
+    background: var(--mcpr-canvas-soft);
+    color: var(--mcpr-body);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    font-weight: 400;
+    line-height: 16px;
+    padding: 2px 8px;
+  }
+
+  .mcpr-file-list {
+    display: grid;
+    gap: 8px;
+  }
+
+  .mcpr-workspace {
+    display: grid;
+    grid-template-columns: minmax(320px, 380px) minmax(0, 1fr);
+    gap: 16px;
+    align-items: start;
+  }
+
+  .mcpr-workspace-sidebar {
+    position: sticky;
+    top: 80px;
+    min-width: 0;
+  }
+
+  .mcpr-workspace-main {
+    display: grid;
+    min-width: 0;
+    gap: 16px;
+  }
+
+  .mcpr-files-panel .mcpr-panel-body {
+    gap: 12px;
+  }
+
+  .mcpr-file-row {
+    display: grid;
+    grid-template-columns: 32px minmax(0, 1fr) auto auto;
+    align-items: center;
+    gap: 12px;
+    min-height: 48px;
+    border-radius: 8px;
+    background: var(--mcpr-canvas-soft);
+    padding: 8px 12px;
+  }
+
+  .mcpr-file-tab-row {
+    min-width: 0;
+  }
+
+  .mcpr-file-tab {
+    display: grid;
+    grid-template-columns: 28px minmax(0, 1fr);
+    gap: 4px 10px;
+    align-items: center;
+    min-width: 0;
+    min-height: 58px;
+    border: 1px solid var(--mcpr-hairline);
+    border-radius: 8px;
+    background: var(--mcpr-canvas-soft);
+    padding: 8px 10px;
+    cursor: grab;
+    text-align: left;
+    transition:
+      border-color 120ms ease,
+      background-color 120ms ease,
+      box-shadow 120ms ease,
+      transform 160ms cubic-bezier(0.2, 0, 0, 1),
+      opacity 120ms ease;
+    width: 100%;
+  }
+
+  .mcpr-file-tab:hover {
+    border-color: var(--mcpr-hairline-strong);
+    background: var(--mcpr-canvas);
+  }
+
+  .mcpr-file-tab:focus-visible {
+    outline: 2px solid var(--mcpr-link);
+    outline-offset: 2px;
+  }
+
+  /* interval 行。ファイル (実線) と区別するため破線枠で、グリップ・マーカー・
+     値・削除を 1 行に並べる。常設 input を持たず draggable はグリップのみ。 */
+  .mcpr-interval-tab {
+    display: grid;
+    grid-template-columns: auto 28px 1fr auto;
+    align-items: center;
+    gap: 10px;
+    min-height: 48px;
+    border: 1px dashed var(--mcpr-hairline);
+    border-radius: 8px;
+    background: var(--mcpr-canvas-soft);
+    padding: 8px 10px;
+    transition:
+      border-color 120ms ease,
+      background-color 120ms ease,
+      box-shadow 120ms ease,
+      transform 160ms cubic-bezier(0.2, 0, 0, 1),
+      opacity 120ms ease;
+  }
+
+  .mcpr-interval-grip {
+    cursor: grab;
+    color: var(--mcpr-muted);
+    user-select: none;
+    line-height: 1;
+    padding: 2px 4px;
+  }
+
+  .mcpr-file-tab-row.is-dragging .mcpr-interval-grip {
+    cursor: grabbing;
+  }
+
+  .mcpr-interval-value {
+    min-width: 0;
+    color: var(--mcpr-ink);
+    font-family: var(--font-mono);
+    font-size: 13px;
+    line-height: 20px;
+    text-align: left;
+    cursor: pointer;
+  }
+
+  .mcpr-interval-value:hover {
+    text-decoration: underline;
+  }
+
+  .mcpr-interval-remove {
+    margin-left: auto;
+  }
+
+  .mcpr-file-tab-row.is-dragging .mcpr-file-tab,
+  .mcpr-file-tab-row.is-dragging .mcpr-interval-tab {
+    cursor: grabbing;
+    opacity: 0.4;
+    /* 抜き取った後の「穴 (プレースホルダ)」に見せる。 */
+    transform: scale(0.97);
+    border-style: dashed;
+    border-color: var(--mcpr-hairline-strong);
+    background: var(--mcpr-canvas-soft);
+    box-shadow: none;
+  }
+
+  .mcpr-file-tab-row.is-active .mcpr-file-tab {
+    border-color: var(--mcpr-ink);
+    background: var(--mcpr-canvas);
+    box-shadow: inset 3px 0 0 var(--mcpr-ink);
+  }
+
+  .mcpr-file-tab-row.is-drop-target .mcpr-file-tab,
+  .mcpr-file-tab-row.is-drop-target .mcpr-interval-tab {
+    /* 「ここに入る」を破線枠＋わずかな拡大＋パルスで明示。 */
+    border-style: dashed;
+    border-color: var(--mcpr-link);
+    background: color-mix(in srgb, var(--mcpr-link) 10%, var(--mcpr-canvas));
+    transform: scale(1.02);
+    animation: mcpr-drop-pulse 1100ms ease-in-out infinite;
+  }
+
+  @keyframes mcpr-drop-pulse {
+    0%,
+    100% {
+      box-shadow:
+        inset 3px 0 0 var(--mcpr-link),
+        0 0 0 1px color-mix(in srgb, var(--mcpr-link) 30%, transparent);
+    }
+    50% {
+      box-shadow:
+        inset 3px 0 0 var(--mcpr-link),
+        0 0 0 4px color-mix(in srgb, var(--mcpr-link) 20%, transparent);
+    }
+  }
+
+  /* ドロップ完了直後、移動した行を一瞬光らせて着地先を示す。 */
+  .mcpr-file-tab-row.is-just-moved .mcpr-file-tab,
+  .mcpr-file-tab-row.is-just-moved .mcpr-interval-tab {
+    animation: mcpr-land 450ms ease-out;
+  }
+
+  @keyframes mcpr-land {
+    0% {
+      background: color-mix(in srgb, var(--mcpr-link) 24%, var(--mcpr-canvas));
+      box-shadow: 0 0 0 2px color-mix(in srgb, var(--mcpr-link) 55%, transparent);
+    }
+    100% {
+      background: var(--mcpr-canvas-soft);
+      box-shadow: none;
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .mcpr-file-tab,
+    .mcpr-interval-tab {
+      transition: border-color 120ms ease, background-color 120ms ease;
+    }
+
+    .mcpr-file-tab-row.is-dragging .mcpr-file-tab,
+    .mcpr-file-tab-row.is-dragging .mcpr-interval-tab,
+    .mcpr-file-tab-row.is-drop-target .mcpr-file-tab,
+    .mcpr-file-tab-row.is-drop-target .mcpr-interval-tab,
+    .mcpr-file-tab-row.is-just-moved .mcpr-file-tab,
+    .mcpr-file-tab-row.is-just-moved .mcpr-interval-tab {
+      transform: none;
+      animation: none;
+    }
+  }
+
+  .mcpr-file-tab .mcpr-file-status {
+    grid-column: 2;
+  }
+
+  .mcpr-row-index {
+    width: 24px;
+    color: var(--mcpr-muted);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    line-height: 16px;
+    text-align: right;
+  }
+
+  .mcpr-filename {
+    min-width: 0;
+    overflow: hidden;
+    color: var(--mcpr-ink);
+    font-family: var(--font-mono);
+    font-size: 13px;
+    line-height: 20px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .mcpr-file-status {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+  }
+
+  .mcpr-muted {
+    color: var(--mcpr-muted);
+  }
+
+  .mcpr-btn {
+    min-height: 32px;
+    border-radius: 100px;
+    font-size: 14px;
+    font-weight: 500;
+    line-height: 20px;
+    letter-spacing: 0;
+  }
+
+  .mcpr-btn-primary {
+    border-color: var(--mcpr-ink);
+    background: var(--mcpr-ink);
+    color: var(--mcpr-on-ink);
+  }
+
+  .mcpr-btn-primary:hover {
+    border-color: var(--mcpr-ink);
+    background: color-mix(in srgb, var(--mcpr-ink) 88%, var(--mcpr-canvas));
+  }
+
+  .mcpr-btn-secondary {
+    border-color: var(--mcpr-hairline);
+    background: var(--mcpr-canvas);
+    color: var(--mcpr-ink);
+  }
+
+  .mcpr-btn-secondary:hover {
+    border-color: var(--mcpr-hairline-strong);
+    background: var(--mcpr-canvas-soft-2);
+  }
+
+  /* 出力フォーマットのセグメンテッドコントロール。トラックで 2 択を 1 つの
+     コントロールとして囲み、選択中だけ ink 塗り + チェックで明示する
+     (隣の Export アクションボタンと取り違えないようにする)。 */
+  .mcpr-segmented {
+    display: inline-flex;
+    padding: 3px;
+    gap: 3px;
+    border-radius: 100px;
+    border: 1px solid var(--mcpr-hairline);
+    background: var(--mcpr-canvas-soft-2);
+  }
+
+  .mcpr-segment {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex: 1 1 0;
+    min-height: 28px;
+    padding: 0 14px;
+    border: 0;
+    border-radius: 100px;
+    background: transparent;
+    color: var(--mcpr-muted);
+    font-size: 14px;
+    font-weight: 500;
+    line-height: 20px;
+    white-space: nowrap;
+    cursor: pointer;
+    transition:
+      background 0.15s ease,
+      color 0.15s ease;
+  }
+
+  .mcpr-segment:hover:not(.is-active) {
+    color: var(--mcpr-ink);
+    background: color-mix(in srgb, var(--mcpr-ink) 8%, transparent);
+  }
+
+  .mcpr-segment.is-active {
+    background: var(--mcpr-ink);
+    color: var(--mcpr-on-ink);
+    font-weight: 600;
+  }
+
+  /* チェック枠は両セグメントに常設し、選択切り替えで文字幅がずれないようにする。 */
+  .mcpr-segment-check {
+    display: inline-block;
+    width: 0.9em;
+    margin-right: 4px;
+    text-align: center;
+    font-size: 12px;
+  }
+
+  .mcpr-btn-danger {
+    border-color: transparent;
+    background: var(--mcpr-error-soft);
+    color: var(--mcpr-error);
+  }
+
+  .mcpr-btn-danger:hover {
+    border-color: var(--mcpr-error);
+    background: var(--mcpr-error);
+    color: #ffffff;
+  }
+
+  .mcpr-divider-row {
+    border-top: 1px solid var(--mcpr-hairline);
+    padding-top: 16px;
+  }
+
+  .mcpr-export-row {
+    display: grid;
+    gap: 12px;
+  }
+
+  .mcpr-field-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    color: var(--mcpr-body);
+    justify-content: space-between;
+  }
+
+  .mcpr-form-input {
+    min-height: 32px;
+    border-color: var(--mcpr-hairline);
+    border-radius: 6px;
+    background: var(--mcpr-canvas);
+    color: var(--mcpr-ink);
+    font-size: 14px;
+    line-height: 20px;
+  }
+
+  .mcpr-progress {
+    height: 8px;
+    border-radius: 9999px;
+    background: var(--mcpr-canvas-soft-2);
+  }
+
+  .mcpr-progress::-webkit-progress-bar {
+    border-radius: 9999px;
+    background: var(--mcpr-canvas-soft-2);
+  }
+
+  .mcpr-progress::-webkit-progress-value {
+    border-radius: 9999px;
+    background: var(--mcpr-ink);
+  }
+
+  .mcpr-progress::-moz-progress-bar {
+    border-radius: 9999px;
+    background: var(--mcpr-ink);
+  }
+
+  .mcpr-alert {
+    border: 1px solid color-mix(in srgb, var(--mcpr-error) 32%, transparent);
+    border-radius: 8px;
+    background: var(--mcpr-error-soft);
+    color: var(--mcpr-error);
+  }
+
+  .mcpr-empty-copy {
+    color: var(--mcpr-body);
+    font-size: 14px;
+    line-height: 22px;
+  }
+
+  .mcpr-meta-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px 24px;
+  }
+
+  .mcpr-meta-row {
+    min-width: 0;
+    color: var(--mcpr-body);
+    font-size: 14px;
+    line-height: 20px;
+  }
+
+  .mcpr-meta-label {
+    margin-right: 8px;
+    color: var(--mcpr-muted);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    line-height: 16px;
+  }
+
+  .mcpr-table-wrap {
+    overflow-x: auto;
+    border: 1px solid var(--mcpr-hairline);
+    border-radius: 8px;
+    background: var(--mcpr-canvas);
+  }
+
+  .mcpr-table {
+    width: 100%;
+    min-width: 42rem;
+    table-layout: fixed;
+    border-collapse: collapse;
+    font-size: 14px;
+    line-height: 20px;
+  }
+
+  .mcpr-table :where(th) {
+    border-bottom: 1px solid var(--mcpr-hairline);
+    background: var(--mcpr-canvas-soft);
+    color: var(--mcpr-muted);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    font-weight: 400;
+    line-height: 16px;
+    padding: 10px 12px;
+    text-align: left;
+  }
+
+  .mcpr-table :where(td) {
+    border-bottom: 1px solid var(--mcpr-hairline);
+    color: var(--mcpr-body);
+    padding: 10px 12px;
+  }
+
+  .mcpr-table :where(tbody tr:last-child td) {
+    border-bottom: 0;
+  }
+
+  .mcpr-table :where(tbody tr:nth-child(even)) {
+    background: var(--mcpr-canvas-soft);
+  }
+
+  .mcpr-table code {
+    color: var(--mcpr-ink);
+    font-family: var(--font-mono);
+    font-size: 13px;
+    line-height: 20px;
+  }
+
+  /* <summary> の三角マーカーを消す */
+  .dropdown > summary.mcpr-icon-button {
+    list-style: none;
+    cursor: pointer;
+  }
+
+  .dropdown > summary.mcpr-icon-button::-webkit-details-marker {
+    display: none;
+  }
+
+  .mcpr-dropdown-menu {
+    z-index: 50;
+    margin-top: 6px;
+    min-width: 180px;
+    border: 1px solid var(--mcpr-hairline);
+    border-radius: 12px;
+    background: var(--mcpr-canvas);
+    box-shadow: var(--mcpr-shadow-3);
+    padding: 6px;
+  }
+
+  .mcpr-upload-modal-box {
+    display: grid;
+    gap: 16px;
+  }
+
+  .mcpr-modal-dropzone {
+    min-height: 140px;
+  }
+
+  .mcpr-interval-dialog-box {
+    display: grid;
+    gap: 16px;
+  }
+}
+
+@media (max-width: 720px) {
+  .mcpr-topbar-inner {
+    padding: 0 16px;
+  }
+
+  .mcpr-nav-link {
+    display: none;
+  }
+
+  .mcpr-page {
+    padding: 32px 16px 64px;
+  }
+
+  .mcpr-empty-state {
+    border-radius: 12px;
+    padding: 32px 20px;
+  }
+
+  .mcpr-hero-title {
+    font-size: 36px;
+    line-height: 40px;
+    letter-spacing: -1.6px;
+  }
+
+  .mcpr-hero-copy {
+    font-size: 16px;
+    line-height: 24px;
+  }
+
+  .mcpr-file-row {
+    grid-template-columns: 24px minmax(0, 1fr);
+  }
+
+  .mcpr-file-row > :nth-child(3),
+  .mcpr-file-row > :nth-child(4) {
+    grid-column: 2;
+  }
+
+  .mcpr-meta-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 960px) {
+  .mcpr-workspace {
+    grid-template-columns: 1fr;
+  }
+
+  .mcpr-workspace-sidebar {
+    position: static;
+  }
+}

@@ -1,28 +1,23 @@
-//! 連結結果のリプレイ書き出し。mcpr-cli の連結パイプライン
-//! (パケットフィルタ無指定時の process() / main()) を in-memory zip に
-//! 対して再現し、ブラウザの Blob ダウンロードへ渡すバイト列を作る。
+//! 連結結果のリプレイ書き出し。順序付き入力を時刻オフセットで連結し、
+//! in-memory zip を組み立てて、ブラウザの Blob ダウンロードへ渡す
+//! バイト列を作る。
 //!
 //! wasm はメインスレッド実行のため、[`export_merged`] は async で
 //! 一定イベント数ごとにブラウザへ制御を返し ([`yield_to_browser`])、
 //! 進捗バーの再描画機会を作る。yield は native では即時完了するので、
-//! `cargo test` では同期関数同様に CLI と同じ挙動 (時刻オフセット・
-//! 接続初期化の除外・メタデータ合成) を検証できる。
+//! `cargo test` では同期関数同様に挙動 (時刻オフセット・メタデータ合成)
+//! を検証できる。
 
 use std::{collections::BTreeSet, io::Cursor};
 
 use mcpr_lib::{
     archive::zip::{ZipArchiveReader, ZipArchiveWriter},
-    event::{
-        Event, EventSink, EventSource, ReplayFormat, ReplayInfo, Time, detect_format,
-        is_connection_init,
-    },
+    event::{EventSink, EventSource, ReplayFormat, ReplayInfo, Time, detect_format},
     flashback::{FlashbackEventSink, FlashbackReader},
     mcpr::{McprEventSink, ReplayReader},
 };
 
-use crate::merge::MergeRule;
-
-/// 書き出し先の物理フォーマット (mcpr-cli の --output-format に対応)。
+/// 書き出し先の物理フォーマット。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ExportFormat {
     #[default]
@@ -47,6 +42,15 @@ impl ExportFormat {
             ExportFormat::Flashback => "Flashback (.zip)",
         }
     }
+}
+
+/// [`export_merged`] の順序付き入力 1 件。リプレイと interval (空白) を
+/// 同列に並べ、出現順にタイムラインへ積む。
+pub enum MergeInput<'a> {
+    /// リプレイ zip のバイト列。
+    Replay(&'a [u8]),
+    /// 直前までのタイムラインへ加算する空白 (ms)。
+    Interval(u64),
 }
 
 /// [`export_merged`] の進捗通知。
@@ -122,29 +126,31 @@ impl ExportSink {
     }
 }
 
-/// 順序付き入力 (リプレイ zip のバイト列) を連結して 1 本のリプレイ zip を
-/// 生成する。連結規則は mcpr-cli と同一:
-/// 時刻オフセット (各入力の duration + interval) を加算し、
-/// [`MergeRule::CliCompatible`] では 2 個目以降の接続初期化パケット
-/// ([`is_connection_init`]) を除外する。
+/// 順序付き入力 (リプレイ zip と interval) を連結して 1 本のリプレイ zip を
+/// 生成する。リストを先頭から走査し、リプレイは現在のオフセットで時刻を積んで
+/// から duration ぶんオフセットを進め、interval はその ms ぶんオフセットを
+/// 進める。行のフィルタはしない。
+///
+/// interval が位置依存になったため、先頭・連続・末尾の interval もすべて
+/// オフセットへ自然に反映される (末尾 interval は最終 duration を伸ばす)。
 ///
 /// `replay_uuid` は Flashback 出力の metadata に書くリプレイ uuid
 /// (乱数生成は呼び出し側の責務。テストでは `Uuid::nil()` で決定的に)。
 /// `on_progress` には最初のイベント、[`YIELD_EVERY_EVENTS`] ごと、
-/// 各入力の処理完了時、および終端処理の開始時に進捗が届く。
+/// 各リプレイの処理完了時、および終端処理の開始時に進捗が届く。
 ///
-/// 注意: [`MergeRule::OffsetOnly`] で複数入力を .mcpr へ書くと、2 個目の
-/// Login パケットで state が後退するためエラーになる (CLI に対応する
-/// 動作モードが存在しない)。
+/// 注意: 複数リプレイを .mcpr へ書くと、2 個目の Login パケットで state が
+/// 後退するためエラーになる (.mcpr の連結は単一リプレイのみ対応)。
 pub async fn export_merged(
-    inputs: &[&[u8]],
-    interval_ms: u64,
-    rule: MergeRule,
+    items: &[MergeInput<'_>],
     format: ExportFormat,
     replay_uuid: uuid::Uuid,
     mut on_progress: impl FnMut(ExportProgress),
 ) -> anyhow::Result<Vec<u8>> {
-    anyhow::ensure!(!inputs.is_empty(), "no input replays");
+    anyhow::ensure!(
+        items.iter().any(|i| matches!(i, MergeInput::Replay(_))),
+        "no input replays"
+    );
 
     let mut sink: Option<ExportSink> = None;
     let mut players = BTreeSet::new();
@@ -155,8 +161,16 @@ pub async fn export_merged(
     // クリック直後の UI 状態を一度描画させてから重い再パースへ入る。
     yield_to_browser().await;
 
-    for (index, bytes) in inputs.iter().enumerate() {
-        let mut zip = ZipArchiveReader::new(Cursor::new(*bytes))?;
+    for item in items {
+        let bytes = match item {
+            // interval はオフセットを進めるだけ (イベント処理なし)。
+            MergeInput::Interval(ms) => {
+                offset_ms += ms;
+                continue;
+            }
+            MergeInput::Replay(bytes) => *bytes,
+        };
+        let mut zip = ZipArchiveReader::new(Cursor::new(bytes))?;
         // McprEventSource は reader を借用するため、match の外で生かす
         let mut mcpr_reader;
         let mut source: Box<dyn EventSource + '_> = match detect_format(&mut zip)? {
@@ -181,14 +195,6 @@ pub async fn export_merged(
                 yield_to_browser().await;
             }
             *event.time_mut() = Time::from_millis(event.time().as_millis() + offset_ms);
-            // 2 個目以降の入力では接続初期化の重複を避ける (CLI の process と同じ規則)
-            if rule == MergeRule::CliCompatible
-                && index > 0
-                && let Event::Packet { state, id, .. } = &event
-                && is_connection_init(*state, *id)
-            {
-                continue;
-            }
             sink.as_sink().push(event)?;
         }
         // 入力の境目でも報告する (小さいファイルでも進捗が動くように)。
@@ -196,7 +202,7 @@ pub async fn export_merged(
         yield_to_browser().await;
 
         players.extend(info.players.iter().cloned());
-        offset_ms += info.duration_ms + interval_ms;
+        offset_ms += info.duration_ms;
         base_info.get_or_insert(info);
     }
 
@@ -205,12 +211,13 @@ pub async fn export_merged(
     yield_to_browser().await;
 
     let info = ReplayInfo {
-        duration_ms: offset_ms.saturating_sub(interval_ms),
+        duration_ms: offset_ms,
         players,
         // mc_version / protocol_version / data_version は先頭から継承
-        ..base_info.expect("inputs is non-empty")
+        ..base_info.expect("at least one replay is ensured above")
     };
-    sink.expect("inputs is non-empty").finish_into_bytes(&info)
+    sink.expect("at least one replay is ensured above")
+        .finish_into_bytes(&info)
 }
 
 /// ダウンロードファイル名。単一入力は先頭ファイル名の拡張子差し替え、
@@ -263,8 +270,8 @@ pub fn trigger_download(bytes: &[u8], filename: &str) {
 mod tests {
     use super::*;
     use mcpr_lib::{
-        event::State,
-        protocol::{FINISH_CONFIGURATION_PACKET_ID, LOGIN_PLAY_PACKET_ID, LOGIN_SUCCESS_PACKET_ID},
+        event::{Event, State},
+        protocol::{FINISH_CONFIGURATION_PACKET_ID, LOGIN_SUCCESS_PACKET_ID},
     };
 
     /// native では [`yield_to_browser`] が即時完了するため、1 回の poll で
@@ -280,20 +287,11 @@ mod tests {
 
     /// 進捗を無視して [`export_merged`] を同期実行するテスト用ラッパ。
     fn export(
-        inputs: &[&[u8]],
-        interval_ms: u64,
-        rule: MergeRule,
+        items: &[MergeInput<'_>],
         format: ExportFormat,
         replay_uuid: uuid::Uuid,
     ) -> anyhow::Result<Vec<u8>> {
-        block_on(export_merged(
-            inputs,
-            interval_ms,
-            rule,
-            format,
-            replay_uuid,
-            |_| {},
-        ))
+        block_on(export_merged(items, format, replay_uuid, |_| {}))
     }
 
     fn packet(time_ms: u64, state: State, id: i32, data: &[u8]) -> Event {
@@ -354,9 +352,7 @@ mod tests {
         let input = mcpr_fixture(events.clone(), &info(1000, &[1, 2]));
 
         let out = export(
-            &[&input],
-            0,
-            MergeRule::CliCompatible,
+            &[MergeInput::Replay(&input)],
             ExportFormat::Mcpr,
             uuid::Uuid::nil(),
         )
@@ -371,43 +367,14 @@ mod tests {
     }
 
     #[test]
-    fn cli_compatible_merge_offsets_and_dedups() {
-        let a = mcpr_fixture(full_stream(&[20]), &info(500, &[1]));
-        let mut b_events = full_stream(&[30]);
-        // 2 個目の Login(play) 0x2b が除外されることも見る
-        b_events.push(packet(40, State::Play, LOGIN_PLAY_PACKET_ID, &[]));
-        let b = mcpr_fixture(b_events, &info(300, &[2]));
-
-        let out = export(
-            &[&a, &b],
-            1000,
-            MergeRule::CliCompatible,
-            ExportFormat::Mcpr,
-            uuid::Uuid::nil(),
-        )
-        .unwrap();
-
-        let (out_info, out_events) = read_mcpr(&out);
-        // 1 個目はそのまま、2 個目は Play の通常パケットのみ (offset = 500 + 1000)
-        let mut expected = full_stream(&[20]);
-        expected.push(packet(1530, State::Play, 0x2c, &[0xaa, 0xbb]));
-        assert_eq!(out_events, expected);
-        // duration = d1 + interval + d2、players は union
-        assert_eq!(out_info.duration_ms, 500 + 1000 + 300);
-        assert_eq!(out_info.players, info(0, &[1, 2]).players);
-    }
-
-    #[test]
-    fn offset_only_multi_input_mcpr_fails() {
-        // OffsetOnly では 2 個目の Login パケットがそのまま流れ、
-        // .mcpr の state が後退するためエラーになる (仕様)。
+    fn multi_input_mcpr_fails_on_login_state_regression() {
+        // 行フィルタをしないため、2 個目の Login パケットがそのまま流れ、
+        // .mcpr の state が後退するためエラーになる (.mcpr 連結は単一入力のみ)。
         let a = mcpr_fixture(full_stream(&[20]), &info(500, &[]));
         let b = mcpr_fixture(full_stream(&[30]), &info(300, &[]));
 
         let err = export(
-            &[&a, &b],
-            0,
-            MergeRule::OffsetOnly,
+            &[MergeInput::Replay(&a), MergeInput::Replay(&b)],
             ExportFormat::Mcpr,
             uuid::Uuid::nil(),
         )
@@ -420,9 +387,7 @@ mod tests {
         let input = mcpr_fixture(full_stream(&[0, 50, 120]), &info(1000, &[]));
 
         let out = export(
-            &[&input],
-            0,
-            MergeRule::CliCompatible,
+            &[MergeInput::Replay(&input)],
             ExportFormat::Flashback,
             uuid::Uuid::nil(),
         )
@@ -464,9 +429,7 @@ mod tests {
 
         let mut progress = Vec::new();
         block_on(export_merged(
-            &[&input],
-            0,
-            MergeRule::CliCompatible,
+            &[MergeInput::Replay(&input)],
             ExportFormat::Mcpr,
             uuid::Uuid::nil(),
             |p| progress.push(p),
@@ -486,11 +449,15 @@ mod tests {
 
     #[test]
     fn empty_inputs_fail() {
+        assert!(export(&[], ExportFormat::Mcpr, uuid::Uuid::nil()).is_err());
+    }
+
+    #[test]
+    fn interval_only_input_fails() {
+        // リプレイが 1 件も無ければ書き出せない。
         assert!(
             export(
-                &[],
-                0,
-                MergeRule::CliCompatible,
+                &[MergeInput::Interval(500)],
                 ExportFormat::Mcpr,
                 uuid::Uuid::nil()
             )
@@ -498,34 +465,43 @@ mod tests {
         );
     }
 
-    /// CLI バイト一致 E2E 用の一時 fixture 出力 (手動検証用、CI では走らない)。
     #[test]
-    #[ignore]
-    fn dump_e2e_fixtures() {
-        let dir = std::path::Path::new("/tmp/mcpr-e2e");
-        std::fs::create_dir_all(dir).unwrap();
-        let a = mcpr_fixture(full_stream(&[20]), &info(500, &[1]));
-        let b = mcpr_fixture(full_stream(&[30]), &info(300, &[2]));
-        std::fs::write(dir.join("a.mcpr"), &a).unwrap();
-        std::fs::write(dir.join("b.mcpr"), &b).unwrap();
+    fn leading_interval_shifts_events_and_extends_duration() {
+        let events = full_stream(&[100, 250]);
+        let input = mcpr_fixture(events, &info(1000, &[]));
+
         let out = export(
-            &[&a, &b],
-            1000,
-            MergeRule::CliCompatible,
+            &[MergeInput::Interval(500), MergeInput::Replay(&input)],
             ExportFormat::Mcpr,
             uuid::Uuid::nil(),
         )
         .unwrap();
-        std::fs::write(dir.join("ui-out.mcpr"), &out).unwrap();
-        let out_fb = export(
-            &[&a, &b],
-            1000,
-            MergeRule::CliCompatible,
-            ExportFormat::Flashback,
+
+        let (out_info, out_events) = read_mcpr(&out);
+        // 先頭 interval ぶん全イベントが後ろへずれる (Login/Config も含む)。
+        let times: Vec<u64> = out_events.iter().map(|e| e.time().as_millis()).collect();
+        assert_eq!(times, vec![500, 500, 600, 750]);
+        // duration = interval + duration
+        assert_eq!(out_info.duration_ms, 1500);
+    }
+
+    #[test]
+    fn trailing_interval_extends_duration_only() {
+        let events = full_stream(&[100]);
+        let input = mcpr_fixture(events, &info(1000, &[]));
+
+        let out = export(
+            &[MergeInput::Replay(&input), MergeInput::Interval(500)],
+            ExportFormat::Mcpr,
             uuid::Uuid::nil(),
         )
         .unwrap();
-        std::fs::write(dir.join("ui-out-fb.zip"), &out_fb).unwrap();
+
+        let (out_info, out_events) = read_mcpr(&out);
+        // イベント時刻はずれず、duration だけ伸びる。
+        let times: Vec<u64> = out_events.iter().map(|e| e.time().as_millis()).collect();
+        assert_eq!(times, vec![0, 0, 100]);
+        assert_eq!(out_info.duration_ms, 1500);
     }
 
     #[test]
