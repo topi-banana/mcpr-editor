@@ -784,6 +784,30 @@
     line-height: 20px;
   }
 
+  /* 書き出しに含めるパケット数を示すバッジ (強調表示) */
+  .mcpr-badge-selected {
+    border-color: var(--mcpr-ink);
+    background: var(--mcpr-ink);
+    color: var(--mcpr-canvas);
+  }
+
+  /* イベント表のパケット採否チェックボックス列 */
+  .mcpr-table :where(th, td).mcpr-check-cell {
+    text-align: center;
+    padding-left: 8px;
+    padding-right: 8px;
+  }
+
+  .mcpr-row-check {
+    vertical-align: middle;
+    cursor: pointer;
+  }
+
+  /* 書き出しから除外されたパケットは控えめに見せる (チェック欄は除く) */
+  .mcpr-table tbody tr.is-excluded td:not(.mcpr-check-cell) {
+    opacity: 0.4;
+  }
+
   /* <summary> の三角マーカーを消す */
   .dropdown > summary.mcpr-icon-button {
     list-style: none;

@@ -1,4 +1,9 @@
-use std::{cmp::Ordering, collections::HashMap, io::Cursor, rc::Rc};
+use std::{
+    cmp::Ordering,
+    collections::{HashMap, HashSet},
+    io::Cursor,
+    rc::Rc,
+};
 
 use gloo_file::{
     File as GlooFile,
@@ -15,8 +20,8 @@ use web_sys::{DragEvent, Event, HtmlDetailsElement, HtmlInputElement};
 use yew::prelude::*;
 
 use crate::export::{
-    ExportFormat, ExportProgress, MergeInput, export_filename, export_merged, new_replay_uuid,
-    trigger_download,
+    ExportFormat, ExportProgress, MergeInput, PacketFilter, export_filename, export_merged,
+    new_replay_uuid, trigger_download,
 };
 
 const PAGE_SIZE: usize = 200;
@@ -372,6 +377,105 @@ impl Reducible for FilesState {
     }
 }
 
+/// 1 ファイル分のパケット採否。デフォルト全採用を O(1) で表すため、全体の
+/// 既定 (`base`) と、それに反する元イベント index の集合 (`flipped`) で持つ。
+/// 採否は `base ^ flipped.contains(index)`。これにより全選択/全解除は
+/// `flipped` を空にするだけで済み、巨大なイベント列でも軽い。
+#[derive(Clone)]
+pub struct PacketSelection {
+    base: bool,
+    flipped: HashSet<usize>,
+}
+
+impl Default for PacketSelection {
+    fn default() -> Self {
+        // 既定は全採用。
+        Self {
+            base: true,
+            flipped: HashSet::new(),
+        }
+    }
+}
+
+impl PacketSelection {
+    fn is_on(&self, index: usize) -> bool {
+        self.base ^ self.flipped.contains(&index)
+    }
+
+    /// 1 件の採否を反転する。
+    fn toggle(&mut self, index: usize) {
+        if !self.flipped.insert(index) {
+            self.flipped.remove(&index);
+        }
+    }
+
+    /// 全件を一括採否する。
+    fn set_all(&mut self, on: bool) {
+        self.base = on;
+        self.flipped.clear();
+    }
+
+    /// 採用件数 (`total` は対象ファイルの全イベント数)。
+    fn on_count(&self, total: usize) -> usize {
+        if self.base {
+            total.saturating_sub(self.flipped.len())
+        } else {
+            self.flipped.len()
+        }
+    }
+}
+
+impl PacketFilter for PacketSelection {
+    fn keep(&self, index: usize) -> bool {
+        self.is_on(index)
+    }
+}
+
+/// パケット選択をファイル id 単位で持つ。エントリの無いファイルは全採用扱い。
+/// 値は Rc にして [`LoadedViewProps`] の再描画判定をポインタ比較で行う。
+#[derive(Default)]
+struct SelectionState {
+    by_file: HashMap<u64, Rc<PacketSelection>>,
+}
+
+enum SelectionAction {
+    /// 1 パケットの採否を反転。
+    Toggle { file_id: u64, index: usize },
+    /// 対象ファイルの全パケットを一括採否。
+    SetAll { file_id: u64, on: bool },
+    /// ファイル削除時に選択も捨てる。
+    Remove { file_id: u64 },
+}
+
+impl Reducible for SelectionState {
+    type Action = SelectionAction;
+
+    fn reduce(self: Rc<Self>, action: SelectionAction) -> Rc<Self> {
+        // by_file は Rc のマップで clone は軽量。更新するファイルの中身だけ複製する。
+        let mut by_file = self.by_file.clone();
+        match action {
+            SelectionAction::Toggle { file_id, index } => {
+                let mut sel = by_file
+                    .get(&file_id)
+                    .map_or_else(PacketSelection::default, |s| (**s).clone());
+                sel.toggle(index);
+                by_file.insert(file_id, Rc::new(sel));
+            }
+            SelectionAction::SetAll { file_id, on } => {
+                let mut sel = by_file
+                    .get(&file_id)
+                    .map_or_else(PacketSelection::default, |s| (**s).clone());
+                sel.set_all(on);
+                by_file.insert(file_id, Rc::new(sel));
+            }
+            SelectionAction::Remove { file_id } => {
+                by_file.remove(&file_id);
+            }
+        }
+        Rc::new(SelectionState { by_file })
+    }
+}
+
 fn state_name(s: State) -> &'static str {
     match s {
         State::Handshaking => "Handshaking",
@@ -477,13 +581,20 @@ enum IntervalDialog {
 /// 書き出し用に並び順のまま組む所有エントリ。借用版 [`MergeInput`] と違い、
 /// Replay は Rc を保持して async タスクへ move できる。
 enum OwnedItem {
-    Replay(Rc<Vec<u8>>),
+    Replay {
+        bytes: Rc<Vec<u8>>,
+        selection: Rc<PacketSelection>,
+    },
     Interval(u64),
 }
 
 #[function_component]
 pub fn App() -> Html {
     let files = use_reducer(FilesState::default);
+    // パケット採否 (ファイル id 単位)。エントリの無いファイルは全採用。
+    let selection = use_reducer(SelectionState::default);
+    // 未編集ファイルへ渡す全採用の既定値。ポインタを安定させ無駄な再描画を避ける。
+    let empty_selection = use_state(|| Rc::new(PacketSelection::default()));
     let selected_file_id = use_state(|| Option::<u64>::None);
     let dragging_file_id = use_state(|| Option::<u64>::None);
     let drop_target_file_id = use_state(|| Option::<u64>::None);
@@ -691,6 +802,7 @@ pub fn App() -> Html {
 
     let on_remove_file = {
         let dispatch = files.dispatcher();
+        let selection_dispatch = selection.dispatcher();
         let readers = readers.clone();
         let selected_file_id = selected_file_id.clone();
         Callback::from(move |id: u64| {
@@ -700,6 +812,7 @@ pub fn App() -> Html {
                 selected_file_id.set(None);
             }
             dispatch.dispatch(FilesAction::Remove { id });
+            selection_dispatch.dispatch(SelectionAction::Remove { file_id: id });
         })
     };
 
@@ -898,6 +1011,8 @@ pub fn App() -> Html {
 
     let on_export = {
         let files = files.clone();
+        let selection = selection.clone();
+        let empty_selection = empty_selection.clone();
         let export_phase = export_phase.clone();
         let export_error = export_error.clone();
         let format = *export_format;
@@ -920,7 +1035,15 @@ pub fn App() -> Html {
                         total += loaded.events.len() as u64;
                         first_filename.get_or_insert_with(|| filename.clone());
                         file_count += 1;
-                        owned.push(OwnedItem::Replay(bytes.clone()));
+                        let sel = selection
+                            .by_file
+                            .get(&entry.id)
+                            .cloned()
+                            .unwrap_or_else(|| (*empty_selection).clone());
+                        owned.push(OwnedItem::Replay {
+                            bytes: bytes.clone(),
+                            selection: sel,
+                        });
                     }
                     // ボタンの disabled と同条件の保険 (全ファイル Loaded のときだけ)。
                     EntryKind::File { .. } => return,
@@ -943,7 +1066,10 @@ pub fn App() -> Html {
                 let items: Vec<MergeInput> = owned
                     .iter()
                     .map(|it| match it {
-                        OwnedItem::Replay(b) => MergeInput::Replay(b.as_slice()),
+                        OwnedItem::Replay { bytes, selection } => MergeInput::Replay {
+                            bytes: bytes.as_slice(),
+                            filter: Some(selection.as_ref() as &dyn PacketFilter),
+                        },
                         OwnedItem::Interval(ms) => MergeInput::Interval(*ms),
                     })
                     .collect();
@@ -1047,6 +1173,24 @@ pub fn App() -> Html {
         _ => ("interval を追加", "追加"),
     };
 
+    // 選択中ファイルのパケット採否と、トグル/全選択のコールバック。
+    // active_file_id が無いとき (未選択) は使われない既定値を渡す。
+    let loaded_selection = active_file_id
+        .and_then(|id| selection.by_file.get(&id).cloned())
+        .unwrap_or_else(|| (*empty_selection).clone());
+    let on_toggle_packet = {
+        let selection_dispatch = selection.dispatcher();
+        Callback::from(move |(file_id, index): (u64, usize)| {
+            selection_dispatch.dispatch(SelectionAction::Toggle { file_id, index });
+        })
+    };
+    let on_set_all_packets = {
+        let selection_dispatch = selection.dispatcher();
+        Callback::from(move |(file_id, on): (u64, bool)| {
+            selection_dispatch.dispatch(SelectionAction::SetAll { file_id, on });
+        })
+    };
+
     html! {
         <div class="mcpr-shell">
             <header class="mcpr-topbar">
@@ -1139,6 +1283,9 @@ pub fn App() -> Html {
                                 <LoadedView key={id.to_string()}
                                     id={*id}
                                     data={data.clone()}
+                                    selection={loaded_selection.clone()}
+                                    on_toggle={on_toggle_packet.clone()}
+                                    on_set_all={on_set_all_packets.clone()}
                                     on_remove={on_remove_file.clone()} />
                             } else {
                                 <section class="mcpr-panel">
@@ -1220,14 +1367,22 @@ pub fn App() -> Html {
 struct LoadedViewProps {
     id: u64,
     data: Rc<Loaded>,
+    /// このファイルのパケット採否。
+    selection: Rc<PacketSelection>,
+    /// (file_id, 元 index) で 1 件の採否を反転。
+    on_toggle: Callback<(u64, usize)>,
+    /// (file_id, on) で全件を一括採否。
+    on_set_all: Callback<(u64, bool)>,
     on_remove: Callback<u64>,
 }
 
-/// events の深い比較 (数百万行になり得る) を避け、merge 結果の
-/// ポインタ同一性だけで再描画を判定する。
+/// events の深い比較 (数百万行になり得る) を避け、data と selection の
+/// ポインタ同一性だけで再描画を判定する (コールバックは再描画に影響しない)。
 impl PartialEq for LoadedViewProps {
     fn eq(&self, other: &Self) -> bool {
-        self.id == other.id && Rc::ptr_eq(&self.data, &other.data)
+        self.id == other.id
+            && Rc::ptr_eq(&self.data, &other.data)
+            && Rc::ptr_eq(&self.selection, &other.selection)
     }
 }
 
@@ -1246,6 +1401,8 @@ fn LoadedView(props: &LoadedViewProps) -> Html {
     let page = use_state(|| 0usize);
     let filter = use_state(EventFilter::default);
     let sort = use_state(|| Option::<(SortKey, SortDir)>::None);
+    // 全選択チェックボックスの中間状態 (indeterminate) は属性に無く DOM 直設定が要る。
+    let header_check_ref = use_node_ref();
 
     // 表示する行の元 index 列 (None = 全行を記録順のまま)。
     // filter / sort / events が変わった時だけ全行を走査する。
@@ -1285,6 +1442,21 @@ fn LoadedView(props: &LoadedViewProps) -> Html {
     let cur_page = (*page).min(total_pages - 1);
     let start = cur_page * PAGE_SIZE;
     let end = (start + PAGE_SIZE).min(shown);
+
+    // パケット採否の集計 (全選択チェックボックスとカウント表示用)。
+    let selected_count = props.selection.on_count(total_all);
+    let all_selected = selected_count == total_all;
+    let none_selected = selected_count == 0;
+    let header_indeterminate = !all_selected && !none_selected;
+    {
+        // indeterminate は HTML 属性に無いため、描画後に DOM へ直接書く。
+        let header_check_ref = header_check_ref.clone();
+        use_effect_with(header_indeterminate, move |&indeterminate| {
+            if let Some(input) = header_check_ref.cast::<HtmlInputElement>() {
+                input.set_indeterminate(indeterminate);
+            }
+        });
+    }
 
     // フィルタ変更時はページを先頭へ戻す。
     let apply_filter = {
@@ -1386,10 +1558,23 @@ fn LoadedView(props: &LoadedViewProps) -> Html {
         Callback::from(move |_| on_remove.emit(id))
     };
 
+    // 全選択チェックボックス: 1 件でも未選択なら全選択、全選択済みなら全解除。
+    let on_toggle_all = {
+        let on_set_all = props.on_set_all.clone();
+        let id = props.id;
+        Callback::from(move |_: Event| on_set_all.emit((id, !all_selected)))
+    };
+
     let rows = (start..end)
         .map(|pos| {
             let orig = indices.as_ref().map_or(pos, |v| v[pos]);
             let row = &all[orig];
+            let checked = props.selection.is_on(orig);
+            let on_check = {
+                let on_toggle = props.on_toggle.clone();
+                let id = props.id;
+                Callback::from(move |_: Event| on_toggle.emit((id, orig)))
+            };
             let (event, state) = match &row.kind {
                 RowKind::Packet { id, state } => (
                     html! { <code>{ format!("0x{id:02x}") }</code> },
@@ -1402,7 +1587,12 @@ fn LoadedView(props: &LoadedViewProps) -> Html {
                 ),
             };
             html! {
-                <tr>
+                <tr class={classes!((!checked).then_some("is-excluded"))}>
+                    <td class="mcpr-check-cell">
+                        <input type="checkbox" class="checkbox checkbox-sm mcpr-row-check"
+                            checked={checked} onchange={on_check}
+                            aria-label="このパケットを書き出しに含める" />
+                    </td>
                     <td>{ orig }</td>
                     <td>{ row.time_ms }</td>
                     <td class="truncate">{ event }</td>
@@ -1453,6 +1643,12 @@ fn LoadedView(props: &LoadedViewProps) -> Html {
                                     format!("{shown} / {total_all}")
                                 } }
                             </span>
+                            if !all_selected {
+                                <span class="mcpr-badge mcpr-badge-selected"
+                                    title="書き出しに含めるパケット数">
+                                    { format!("{selected_count} selected") }
+                                </span>
+                            }
                         </h2>
                         <div class="join">
                             <button class="btn btn-sm join-item mcpr-btn mcpr-btn-secondary" onclick={prev}
@@ -1476,6 +1672,12 @@ fn LoadedView(props: &LoadedViewProps) -> Html {
                         <table class="mcpr-table">
                             <thead>
                                 <tr>
+                                    <th class="mcpr-check-cell w-10">
+                                        <input type="checkbox" ref={header_check_ref}
+                                            class="checkbox checkbox-sm mcpr-row-check"
+                                            checked={all_selected} onchange={on_toggle_all}
+                                            aria-label="すべてのパケットを選択 / 解除" />
+                                    </th>
                                     { sortable_th("#", SortKey::Index, Some("w-24")) }
                                     { sortable_th("time (ms)", SortKey::Time, Some("w-28")) }
                                     { sortable_th("event", SortKey::Event, None) }
