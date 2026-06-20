@@ -53,7 +53,9 @@ impl ActionKind {
             ActionKind::CreateLocalPlayer => "flashback:action/create_local_player",
             ActionKind::MoveEntities => "flashback:action/move_entities",
             ActionKind::LevelChunkCached => "flashback:action/level_chunk_cached",
-            ActionKind::AccuratePlayerPosition => "flashback:action/accurate_player_position",
+            ActionKind::AccuratePlayerPosition => {
+                "flashback:action/accurate_player_position_optional"
+            }
             ActionKind::Unknown(s) => s.as_str(),
         }
     }
@@ -73,7 +75,9 @@ impl FromStr for ActionKind {
             "flashback:action/create_local_player" => ActionKind::CreateLocalPlayer,
             "flashback:action/move_entities" => ActionKind::MoveEntities,
             "flashback:action/level_chunk_cached" => ActionKind::LevelChunkCached,
-            "flashback:action/accurate_player_position" => ActionKind::AccuratePlayerPosition,
+            "flashback:action/accurate_player_position_optional" => {
+                ActionKind::AccuratePlayerPosition
+            }
             _ => return Err(()),
         })
     }
@@ -703,7 +707,7 @@ mod tests {
             "flashback:action/create_local_player",
             "flashback:action/move_entities",
             "flashback:action/level_chunk_cached",
-            "flashback:action/accurate_player_position",
+            "flashback:action/accurate_player_position_optional",
         ] {
             let k = ActionKind::parse(name);
             assert!(!matches!(k, ActionKind::Unknown(_)));
