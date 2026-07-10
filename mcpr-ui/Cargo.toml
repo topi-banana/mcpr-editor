@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-yew = { version = "0.21", features = ["csr"] }
+yew = { version = "0.23", features = ["csr"] }
 mcpr-lib = { path = "../mcpr-lib", default-features = false }
 anyhow = "1.0"
 gloo-file = "0.3"
