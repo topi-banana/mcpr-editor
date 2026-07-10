@@ -13,8 +13,8 @@ use mcpr_lib::{
         zip::{ZipArchiveReader, ZipArchiveWriter},
     },
     event::{
-        Event, EventSink, EventSource, ReplayFormat, ReplayInfo, State, Time, detect_format,
-        is_connection_init,
+        Event, EventSink, EventSource, PlaybackSpeed, ReplayFormat, ReplayInfo, State, Time,
+        detect_format, is_connection_init,
     },
     flashback::{FlashbackEventSink, FlashbackReader},
     mcpr::{McprEventSink, ReplayReader},
@@ -69,6 +69,10 @@ struct Args {
     /// 入力リプレイ間に挿入する間隔 (ms)
     #[arg(long, default_value_t = 0)]
     interval: u32,
+
+    /// 再生速度倍率 (2.0 = 2倍速, 0.5 = 半速)
+    #[arg(long, default_value_t = PlaybackSpeed::NORMAL)]
+    speed: PlaybackSpeed,
 
     /// flashback 入力で snapshot (初期状態の合成イベント) を読み飛ばす
     #[arg(long, default_value_t = false)]
@@ -281,7 +285,11 @@ fn process<S: EventSource>(
     }
 
     while let Some(mut event) = source.next_event()? {
-        *event.time_mut() = Time::from_millis(event.time().as_millis() + offset_ms);
+        *event.time_mut() = Time::from_millis(
+            args.speed
+                .scale_millis(event.time().as_millis())
+                .saturating_add(offset_ms),
+        );
 
         if let Event::Packet { state, id, .. } = &event {
             // Play パケットの include/exclude フィルタ
@@ -362,7 +370,7 @@ fn main() -> anyhow::Result<()> {
         )?;
 
         players.extend(info.players.iter().cloned());
-        offset_ms += info.duration_ms + args.interval as u64;
+        offset_ms += args.speed.scale_millis(info.duration_ms) + args.interval as u64;
         merged_info.get_or_insert(info);
     }
 

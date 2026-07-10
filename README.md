@@ -17,6 +17,7 @@ Options:
       --unknow-packet
   -c, --compression-level <COMPRESSION_LEVEL>
       --interval <INTERVAL>                    [default: 0]
+      --speed <SPEED>                          [default: 1]
   -h, --help                                   Print help
   -V, --version   
 ```
@@ -40,7 +41,7 @@ Options:
 
 - [x] connect
 - [ ] cut
-- [ ] change speed
+- [x] change speed
 - [x] packet restriction (include/exclude)
 - [x] compress
 - [x] show packet details

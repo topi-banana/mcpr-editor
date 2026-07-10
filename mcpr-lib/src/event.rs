@@ -9,7 +9,7 @@
 //! `LevelChunkCached` のチャンク外部化など）は各アダプタが吸収し、
 //! この層には現れない。
 
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, fmt, str::FromStr};
 
 use crate::{
     archive::ArchiveReader,
@@ -43,6 +43,66 @@ impl Time {
     /// 切り捨てで tick に換算する。
     pub fn as_ticks(&self) -> u64 {
         self.millis / Self::MS_PER_TICK
+    }
+}
+
+/// リプレイの再生速度倍率。
+///
+/// `2.0x` は 2 倍速なのでイベント時刻・duration は 1/2 になる。
+/// `0.5x` は半速なのでイベント時刻・duration は 2 倍になる。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PlaybackSpeed {
+    multiplier: f64,
+}
+
+impl PlaybackSpeed {
+    pub const NORMAL: PlaybackSpeed = PlaybackSpeed { multiplier: 1.0 };
+
+    pub fn new(multiplier: f64) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            multiplier.is_finite() && multiplier > 0.0,
+            "speed must be a finite number greater than 0"
+        );
+        Ok(Self { multiplier })
+    }
+
+    pub fn multiplier(self) -> f64 {
+        self.multiplier
+    }
+
+    pub fn scale_millis(self, millis: u64) -> u64 {
+        let scaled = (millis as f64 / self.multiplier).round();
+        if scaled <= 0.0 {
+            0
+        } else if scaled >= u64::MAX as f64 {
+            u64::MAX
+        } else {
+            scaled as u64
+        }
+    }
+
+    pub fn scale_time(self, time: Time) -> Time {
+        Time::from_millis(self.scale_millis(time.as_millis()))
+    }
+}
+
+impl Default for PlaybackSpeed {
+    fn default() -> Self {
+        Self::NORMAL
+    }
+}
+
+impl fmt::Display for PlaybackSpeed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.multiplier)
+    }
+}
+
+impl FromStr for PlaybackSpeed {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::new(s.trim().parse()?)
     }
 }
 
@@ -243,6 +303,25 @@ mod tests {
         assert_eq!(Time::from_millis(49).as_ticks(), 0);
         assert_eq!(Time::from_millis(50).as_ticks(), 1);
         assert_eq!(Time::from_millis(99).as_ticks(), 1);
+    }
+
+    #[test]
+    fn playback_speed_scales_millis_by_inverse_multiplier() {
+        let fast = PlaybackSpeed::new(2.0).unwrap();
+        let slow = PlaybackSpeed::new(0.5).unwrap();
+
+        assert_eq!(fast.scale_millis(1000), 500);
+        assert_eq!(slow.scale_millis(1000), 2000);
+        assert_eq!(PlaybackSpeed::new(3.0).unwrap().scale_millis(1000), 333);
+    }
+
+    #[test]
+    fn playback_speed_rejects_invalid_multiplier() {
+        for speed in [0.0, -1.0, f64::INFINITY, f64::NAN] {
+            assert!(PlaybackSpeed::new(speed).is_err());
+        }
+        assert!("0".parse::<PlaybackSpeed>().is_err());
+        assert!("NaN".parse::<PlaybackSpeed>().is_err());
     }
 
     #[test]

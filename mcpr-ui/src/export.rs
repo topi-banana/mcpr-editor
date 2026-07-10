@@ -12,7 +12,7 @@ use std::{collections::BTreeSet, io::Cursor};
 
 use mcpr_lib::{
     archive::zip::{ZipArchiveReader, ZipArchiveWriter},
-    event::{EventSink, EventSource, ReplayFormat, ReplayInfo, Time, detect_format},
+    event::{EventSink, EventSource, PlaybackSpeed, ReplayFormat, ReplayInfo, Time, detect_format},
     flashback::{FlashbackEventSink, FlashbackReader},
     mcpr::{McprEventSink, ReplayReader},
 };
@@ -62,6 +62,7 @@ pub enum MergeInput<'a> {
     Replay {
         bytes: &'a [u8],
         filter: Option<&'a dyn PacketFilter>,
+        speed: PlaybackSpeed,
     },
     /// 直前までのタイムラインへ加算する空白 (ms)。
     Interval(u64),
@@ -142,9 +143,9 @@ impl ExportSink {
 
 /// 順序付き入力 (リプレイ zip と interval) を連結して 1 本のリプレイ zip を
 /// 生成する。リストを先頭から走査し、リプレイは現在のオフセットで時刻を積んで
-/// から duration ぶんオフセットを進め、interval はその ms ぶんオフセットを
-/// 進める。各リプレイの [`PacketFilter`] で採用外のパケットは出力から落とす
-/// (duration は元の値のまま使うため、間引いてもタイムラインは詰まらない)。
+/// から速度適用後の duration ぶんオフセットを進め、interval はその ms ぶん
+/// オフセットを進める。各リプレイの [`PacketFilter`] で採用外のパケットは
+/// 出力から落とす (duration はフィルタでは詰めず、速度だけを反映する)。
 ///
 /// interval が位置依存になったため、先頭・連続・末尾の interval もすべて
 /// オフセットへ自然に反映される (末尾 interval は最終 duration を伸ばす)。
@@ -177,13 +178,17 @@ pub async fn export_merged(
     yield_to_browser().await;
 
     for item in items {
-        let (bytes, filter) = match item {
+        let (bytes, filter, speed) = match item {
             // interval はオフセットを進めるだけ (イベント処理なし)。
             MergeInput::Interval(ms) => {
                 offset_ms += ms;
                 continue;
             }
-            MergeInput::Replay { bytes, filter } => (*bytes, *filter),
+            MergeInput::Replay {
+                bytes,
+                filter,
+                speed,
+            } => (*bytes, *filter, *speed),
         };
         let mut zip = ZipArchiveReader::new(Cursor::new(bytes))?;
         // McprEventSource は reader を借用するため、match の外で生かす
@@ -216,7 +221,11 @@ pub async fn export_merged(
             if !keep {
                 continue;
             }
-            *event.time_mut() = Time::from_millis(event.time().as_millis() + offset_ms);
+            *event.time_mut() = Time::from_millis(
+                speed
+                    .scale_millis(event.time().as_millis())
+                    .saturating_add(offset_ms),
+            );
             sink.as_sink().push(event)?;
         }
         // 入力の境目でも報告する (小さいファイルでも進捗が動くように)。
@@ -224,7 +233,7 @@ pub async fn export_merged(
         yield_to_browser().await;
 
         players.extend(info.players.iter().cloned());
-        offset_ms += info.duration_ms;
+        offset_ms += speed.scale_millis(info.duration_ms);
         base_info.get_or_insert(info);
     }
 
@@ -321,6 +330,7 @@ mod tests {
         MergeInput::Replay {
             bytes,
             filter: None,
+            speed: PlaybackSpeed::NORMAL,
         }
     }
 
@@ -427,6 +437,7 @@ mod tests {
             &[MergeInput::Replay {
                 bytes: &input,
                 filter: Some(&filter),
+                speed: PlaybackSpeed::NORMAL,
             }],
             ExportFormat::Mcpr,
             uuid::Uuid::nil(),
@@ -561,6 +572,28 @@ mod tests {
         let times: Vec<u64> = out_events.iter().map(|e| e.time().as_millis()).collect();
         assert_eq!(times, vec![0, 0, 100]);
         assert_eq!(out_info.duration_ms, 1500);
+    }
+
+    #[test]
+    fn speed_scales_event_times_and_duration() {
+        let events = full_stream(&[100, 250]);
+        let input = mcpr_fixture(events, &info(1000, &[]));
+
+        let out = export(
+            &[MergeInput::Replay {
+                bytes: &input,
+                filter: None,
+                speed: PlaybackSpeed::new(2.0).unwrap(),
+            }],
+            ExportFormat::Mcpr,
+            uuid::Uuid::nil(),
+        )
+        .unwrap();
+
+        let (out_info, out_events) = read_mcpr(&out);
+        let times: Vec<u64> = out_events.iter().map(|e| e.time().as_millis()).collect();
+        assert_eq!(times, vec![0, 0, 50, 125]);
+        assert_eq!(out_info.duration_ms, 500);
     }
 
     #[test]
