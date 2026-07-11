@@ -11,7 +11,10 @@ use gloo_file::{
 };
 use mcpr_lib::{
     archive::zip::ZipArchiveReader,
-    event::{Event as ReplayEvent, EventSource, ReplayFormat, ReplayInfo, State, detect_format},
+    event::{
+        Event as ReplayEvent, EventSource, PlaybackSpeed, ReplayFormat, ReplayInfo, State,
+        detect_format,
+    },
     flashback::FlashbackReader,
     mcpr::ReplayReader,
     protocol::parse_packet_id,
@@ -270,12 +273,12 @@ enum EntryKind {
     File {
         filename: String,
         state: EntryState,
+        /// 再生速度倍率の入力原文。空/不正値は書き出し時にエラーにする。
+        speed_input: String,
     },
     /// 連結時に直前までのタイムラインへ加算する空白。入力欄の原文を保持し、
     /// parse 失敗は 0 扱い (旧 interval 入力欄と同じ方針)。
-    Interval {
-        input: String,
-    },
+    Interval { input: String },
 }
 
 /// 連結リストの 1 エントリ。`id` は発番順の安定キー
@@ -315,6 +318,11 @@ enum FilesAction {
         id: u64,
         input: String,
     },
+    /// 既存ファイルの速度倍率を差し替える。
+    SetSpeed {
+        id: u64,
+        input: String,
+    },
     Remove {
         id: u64,
     },
@@ -336,6 +344,7 @@ impl Reducible for FilesState {
                 kind: EntryKind::File {
                     filename,
                     state: EntryState::Loading,
+                    speed_input: "1".to_string(),
                 },
             }),
             FilesAction::Finish { id, result } => {
@@ -357,6 +366,13 @@ impl Reducible for FilesState {
                     entries.iter_mut().find(|e| e.id == id).map(|e| &mut e.kind)
                 {
                     *slot = input;
+                }
+            }
+            FilesAction::SetSpeed { id, input } => {
+                if let Some(EntryKind::File { speed_input, .. }) =
+                    entries.iter_mut().find(|e| e.id == id).map(|e| &mut e.kind)
+                {
+                    *speed_input = input;
                 }
             }
             FilesAction::Remove { id } => entries.retain(|e| e.id != id),
@@ -610,14 +626,29 @@ enum IntervalDialog {
     Edit(u64),
 }
 
+/// speed 入力ダイアログの開閉と対象。
+#[derive(Clone, Copy, PartialEq)]
+enum SpeedDialog {
+    Closed,
+    Edit(u64),
+}
+
 /// 書き出し用に並び順のまま組む所有エントリ。借用版 [`MergeInput`] と違い、
 /// Replay は Rc を保持して async タスクへ move できる。
 enum OwnedItem {
     Replay {
         bytes: Rc<Vec<u8>>,
         selection: Rc<PacketSelection>,
+        speed: PlaybackSpeed,
     },
     Interval(u64),
+}
+
+fn speed_label(input: &str) -> String {
+    match input.trim().parse::<PlaybackSpeed>() {
+        Ok(speed) => format!("{speed}x"),
+        Err(_) => "invalid".to_string(),
+    }
 }
 
 #[function_component]
@@ -640,6 +671,8 @@ pub fn App() -> Html {
     // interval 入力ダイアログ。draft は数値欄の原文を保持し、parse 失敗は 0 扱い。
     let interval_dialog = use_state(|| IntervalDialog::Closed);
     let interval_draft = use_state(String::new);
+    let speed_dialog = use_state(|| SpeedDialog::Closed);
+    let speed_draft = use_state(String::new);
 
     // 書き出し設定と進行状態 (None = 書き出し中でない)。
     let export_format = use_state(ExportFormat::default);
@@ -816,21 +849,57 @@ pub fn App() -> Html {
         let interval_dialog = interval_dialog.clone();
         Callback::from(move |_: MouseEvent| interval_dialog.set(IntervalDialog::Closed))
     };
+    let on_edit_speed = {
+        let speed_dialog = speed_dialog.clone();
+        let speed_draft = speed_draft.clone();
+        Callback::from(move |(id, current): (u64, String)| {
+            speed_draft.set(current);
+            speed_dialog.set(SpeedDialog::Edit(id));
+        })
+    };
+    let on_speed_draft = {
+        let speed_draft = speed_draft.clone();
+        Callback::from(move |e: InputEvent| {
+            let input: HtmlInputElement = e.target_unchecked_into();
+            speed_draft.set(input.value());
+        })
+    };
+    let on_speed_confirm = {
+        let dispatch = files.dispatcher();
+        let speed_dialog = speed_dialog.clone();
+        let speed_draft = speed_draft.clone();
+        Callback::from(move |_: MouseEvent| {
+            if let SpeedDialog::Edit(id) = *speed_dialog {
+                dispatch.dispatch(FilesAction::SetSpeed {
+                    id,
+                    input: (*speed_draft).clone(),
+                });
+            }
+            speed_dialog.set(SpeedDialog::Closed);
+        })
+    };
+    let on_speed_cancel = {
+        let speed_dialog = speed_dialog.clone();
+        Callback::from(move |_: MouseEvent| speed_dialog.set(SpeedDialog::Closed))
+    };
 
     // Loaded なファイルだけを選択対象にする (interval は対象外)。
     let find_loaded = |want: Option<u64>| {
         files.entries.iter().find_map(|entry| match &entry.kind {
             EntryKind::File {
                 state: EntryState::Loaded { loaded, .. },
+                speed_input,
                 ..
-            } if want.is_none_or(|id| entry.id == id) => Some((entry.id, loaded.clone())),
+            } if want.is_none_or(|id| entry.id == id) => {
+                Some((entry.id, loaded.clone(), speed_input.clone()))
+            }
             _ => None,
         })
     };
     let selected_file = (*selected_file_id)
         .and_then(|selected_id| find_loaded(Some(selected_id)))
         .or_else(|| find_loaded(None));
-    let active_file_id = selected_file.as_ref().map(|(id, _)| *id);
+    let active_file_id = selected_file.as_ref().map(|(id, _, _)| *id);
 
     let on_remove_file = {
         let dispatch = files.dispatcher();
@@ -931,7 +1000,9 @@ pub fn App() -> Html {
             };
 
             let row = match &entry.kind {
-                EntryKind::File { filename, state } => {
+                EntryKind::File {
+                    filename, state, ..
+                } => {
                     let is_loaded = matches!(state, EntryState::Loaded { .. });
                     let is_active = active_file_id == Some(id);
                     let index = file_no;
@@ -1063,7 +1134,15 @@ pub fn App() -> Html {
                     EntryKind::File {
                         filename,
                         state: EntryState::Loaded { loaded, bytes },
+                        speed_input,
                     } => {
+                        let speed = match speed_input.trim().parse::<PlaybackSpeed>() {
+                            Ok(speed) => speed,
+                            Err(e) => {
+                                export_error.set(Some(format!("speed error: {e}")));
+                                return;
+                            }
+                        };
                         total += loaded.events.len() as u64;
                         first_filename.get_or_insert_with(|| filename.clone());
                         file_count += 1;
@@ -1075,6 +1154,7 @@ pub fn App() -> Html {
                         owned.push(OwnedItem::Replay {
                             bytes: bytes.clone(),
                             selection: sel,
+                            speed,
                         });
                     }
                     // ボタンの disabled と同条件の保険 (全ファイル Loaded のときだけ)。
@@ -1098,9 +1178,14 @@ pub fn App() -> Html {
                 let items: Vec<MergeInput> = owned
                     .iter()
                     .map(|it| match it {
-                        OwnedItem::Replay { bytes, selection } => MergeInput::Replay {
+                        OwnedItem::Replay {
+                            bytes,
+                            selection,
+                            speed,
+                        } => MergeInput::Replay {
                             bytes: bytes.as_slice(),
                             filter: Some(selection.as_ref() as &dyn PacketFilter),
+                            speed: *speed,
                         },
                         OwnedItem::Interval(ms) => MergeInput::Interval(*ms),
                     })
@@ -1204,6 +1289,7 @@ pub fn App() -> Html {
         IntervalDialog::Edit(_) => ("interval を編集", "保存"),
         _ => ("interval を追加", "追加"),
     };
+    let speed_dialog_open = *speed_dialog != SpeedDialog::Closed;
 
     // 選択中ファイルのパケット採否と、トグル/全選択のコールバック。
     // active_file_id が無いとき (未選択) は使われない既定値を渡す。
@@ -1323,14 +1409,16 @@ pub fn App() -> Html {
                             </div>
                         </aside>
                         <div class="mcpr-workspace-main">
-                            if let Some((id, data)) = selected_file.as_ref() {
+                            if let Some((id, data, speed_input)) = selected_file.as_ref() {
                                 <LoadedView key={id.to_string()}
                                     id={*id}
                                     data={data.clone()}
+                                    speed_input={speed_input.clone()}
                                     selection={loaded_selection.clone()}
                                     on_toggle={on_toggle_packet.clone()}
                                     on_set_all={on_set_all_packets.clone()}
                                     on_set_many={on_set_many_packets.clone()}
+                                    on_edit_speed={on_edit_speed.clone()}
                                     on_remove={on_remove_file.clone()} />
                             } else {
                                 <section class="mcpr-panel">
@@ -1403,6 +1491,34 @@ pub fn App() -> Html {
                     // 背景クリックで閉じる
                     <div class="modal-backdrop" onclick={on_interval_cancel}></div>
                 </div>
+
+                <div class={classes!("modal", speed_dialog_open.then_some("modal-open"))}
+                    role="dialog" aria-modal="true">
+                    <div class="modal-box mcpr-speed-dialog-box">
+                        <div class="mcpr-section-header">
+                            <h3 class="mcpr-section-title">{ "Change Speed" }</h3>
+                            <button type="button" class="mcpr-icon-button"
+                                aria-label="閉じる" title="閉じる" onclick={on_speed_cancel.clone()}>
+                                { "✕" }
+                            </button>
+                        </div>
+                        <label class="mcpr-field-row">
+                            { "speed (x)" }
+                            <input type="number" min="0.000001" step="0.1"
+                                class="input input-bordered input-sm w-28 font-mono mcpr-form-input"
+                                value={(*speed_draft).clone()}
+                                oninput={on_speed_draft} />
+                        </label>
+                        <div class="flex justify-end">
+                            <button type="button" class="btn btn-sm mcpr-btn mcpr-btn-primary"
+                                onclick={on_speed_confirm}>
+                                { "保存" }
+                            </button>
+                        </div>
+                    </div>
+                    // 背景クリックで閉じる
+                    <div class="modal-backdrop" onclick={on_speed_cancel}></div>
+                </div>
             </main>
         </div>
     }
@@ -1412,6 +1528,7 @@ pub fn App() -> Html {
 struct LoadedViewProps {
     id: u64,
     data: Rc<Loaded>,
+    speed_input: String,
     /// このファイルのパケット採否。
     selection: Rc<PacketSelection>,
     /// (file_id, 元 index) で 1 件の採否を反転。
@@ -1420,6 +1537,7 @@ struct LoadedViewProps {
     on_set_all: Callback<(u64, bool)>,
     /// (file_id, 元 index 集合, on) でドラッグ範囲選択した複数件をまとめて採否。
     on_set_many: Callback<(u64, Rc<HashSet<usize>>, bool)>,
+    on_edit_speed: Callback<(u64, String)>,
     on_remove: Callback<u64>,
 }
 
@@ -1429,6 +1547,7 @@ impl PartialEq for LoadedViewProps {
     fn eq(&self, other: &Self) -> bool {
         self.id == other.id
             && Rc::ptr_eq(&self.data, &other.data)
+            && self.speed_input == other.speed_input
             && Rc::ptr_eq(&self.selection, &other.selection)
     }
 }
@@ -1616,6 +1735,14 @@ fn LoadedView(props: &LoadedViewProps) -> Html {
         let id = props.id;
         Callback::from(move |_| on_remove.emit(id))
     };
+    let speed_display = speed_label(&props.speed_input);
+    let speed_invalid = speed_display == "invalid";
+    let on_edit_speed = {
+        let on_edit_speed = props.on_edit_speed.clone();
+        let id = props.id;
+        let current = props.speed_input.clone();
+        Callback::from(move |_: MouseEvent| on_edit_speed.emit((id, current.clone())))
+    };
 
     // 全選択チェックボックス: 1 件でも未選択なら全選択、全選択済みなら全解除。
     let on_toggle_all = {
@@ -1761,6 +1888,19 @@ fn LoadedView(props: &LoadedViewProps) -> Html {
                         <MetaRow label="dataVersion" value={
                             props.data.info.data_version.map_or_else(|| "—".to_string(), |v| v.to_string())
                         } />
+                        <div class="mcpr-meta-row mcpr-meta-speed-row">
+                            <span class="mcpr-meta-label">{ "speed:" }</span>
+                            <button type="button"
+                                class={classes!(
+                                    "mcpr-meta-speed-button",
+                                    speed_invalid.then_some("is-invalid"),
+                                )}
+                                onclick={on_edit_speed}
+                                title="Change Speed">
+                                <span class="mcpr-meta-speed-value">{ speed_display }</span>
+                                <span class="mcpr-meta-speed-action">{ "Change" }</span>
+                            </button>
+                        </div>
                         <MetaRow label="players" value={props.data.info.players.len().to_string()} />
                         <MetaRow label="events" value={total_all.to_string()} />
                     </div>
@@ -1898,6 +2038,7 @@ mod tests {
             kind: EntryKind::File {
                 filename: format!("{id}.mcpr"),
                 state: EntryState::Loading,
+                speed_input: "1".to_string(),
             },
         }
     }
@@ -1968,6 +2109,28 @@ mod tests {
             })
             .collect();
         assert_eq!(inputs, vec![None, Some("1200")]);
+    }
+
+    #[test]
+    fn set_speed_updates_only_matching_file() {
+        let state = Rc::new(FilesState {
+            entries: vec![loading_file(1), interval_entry(2, "500")],
+        });
+
+        let state = state.reduce(FilesAction::SetSpeed {
+            id: 1,
+            input: "2".to_string(),
+        });
+
+        let speeds: Vec<Option<&str>> = state
+            .entries
+            .iter()
+            .map(|e| match &e.kind {
+                EntryKind::File { speed_input, .. } => Some(speed_input.as_str()),
+                EntryKind::Interval { .. } => None,
+            })
+            .collect();
+        assert_eq!(speeds, vec![Some("2"), None]);
     }
 
     #[test]

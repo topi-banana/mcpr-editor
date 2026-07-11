@@ -735,6 +735,53 @@
     line-height: 16px;
   }
 
+  .mcpr-meta-speed-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .mcpr-meta-speed-button {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+    min-height: 28px;
+    border: 1px solid var(--mcpr-hairline);
+    border-radius: 6px;
+    background: var(--mcpr-canvas);
+    color: var(--mcpr-body);
+    padding: 3px 8px;
+  }
+
+  .mcpr-meta-speed-button:hover {
+    border-color: var(--mcpr-hairline-strong);
+    background: var(--mcpr-canvas-soft-2);
+    color: var(--mcpr-ink);
+  }
+
+  .mcpr-meta-speed-button.is-invalid {
+    border-color: var(--mcpr-error);
+    background: var(--mcpr-error-soft);
+    color: var(--mcpr-error);
+  }
+
+  .mcpr-meta-speed-value {
+    color: var(--mcpr-ink);
+    font-family: var(--font-mono);
+    font-size: 13px;
+    line-height: 20px;
+    white-space: nowrap;
+  }
+
+  .mcpr-meta-speed-action {
+    color: var(--mcpr-muted);
+    font-size: 12px;
+    font-weight: 500;
+    line-height: 16px;
+    white-space: nowrap;
+  }
+
   .mcpr-table-wrap {
     overflow-x: auto;
     border: 1px solid var(--mcpr-hairline);
@@ -860,7 +907,8 @@
     min-height: 140px;
   }
 
-  .mcpr-interval-dialog-box {
+  .mcpr-interval-dialog-box,
+  .mcpr-speed-dialog-box {
     display: grid;
     gap: 16px;
   }
