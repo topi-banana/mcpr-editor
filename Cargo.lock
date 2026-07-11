@@ -770,6 +770,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "mcpr-app"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "getrandom 0.3.2",
+ "gloo-timers",
+ "mcpr-lib",
+ "uuid",
+]
+
+[[package]]
 name = "mcpr-cli"
 version = "0.1.0"
 dependencies = [

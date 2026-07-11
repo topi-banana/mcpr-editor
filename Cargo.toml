@@ -4,4 +4,5 @@ members = [
     "mcpr-lib",
     "mcpr-cli",
     "mcpr-ui",
+    "mcpr-app",
 ]
