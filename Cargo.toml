@@ -5,4 +5,19 @@ members = [
     "mcpr-cli",
     "mcpr-ui",
     "mcpr-app",
+    "mcpr-gpui",
 ]
+# mcpr-gpui は gpui のシステム依存 (libxkbcommon 等) と巨大な git 依存を伴うため、
+# 既定ビルド (cargo test / build / clippy を --workspace 無しで打つ CI) から外す。
+# ビルドは明示指定する: cargo run -p mcpr-gpui
+default-members = [
+    "mcpr-lib",
+    "mcpr-cli",
+    "mcpr-ui",
+    "mcpr-app",
+]
+
+# gpui-component が要求する psm の版 (同リポジトリの patch を踏襲)。
+# patch はワークスペースルートでのみ有効。
+[patch.crates-io]
+psm = { git = "https://github.com/rust-lang/stacker", branch = "master" }
