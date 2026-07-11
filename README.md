@@ -26,7 +26,7 @@ Options:
 
 - [x] Library
 - [x] CLI
-- [ ] Web App
+- [x] Web App
 - [ ] ...
 
 ### Library
