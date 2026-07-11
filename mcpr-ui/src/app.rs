@@ -1,31 +1,23 @@
 use std::{
-    cmp::Ordering,
     collections::{HashMap, HashSet},
-    io::Cursor,
     rc::Rc,
+    sync::Arc,
 };
 
 use gloo_file::{
     File as GlooFile,
     callbacks::{FileReader, read_as_bytes},
 };
-use mcpr_lib::{
-    archive::zip::ZipArchiveReader,
-    event::{
-        Event as ReplayEvent, EventSource, PlaybackSpeed, ReplayFormat, ReplayInfo, State,
-        detect_format,
-    },
-    flashback::FlashbackReader,
-    mcpr::ReplayReader,
-    protocol::parse_packet_id,
+use mcpr_app::{
+    EntryKind, EntryState, EventFilter, ExportFormat, ExportPhase, ExportPlan, FilesAction,
+    FilesState, Loaded, PacketSelection, RowKind, SelectionAction, SelectionState, SortDir,
+    SortKey, as_merge_inputs, build_export_plan, compute_indices, export_filename, export_merged,
+    new_replay_uuid, parse_replay, speed_label, state_name,
 };
 use web_sys::{DragEvent, Event, HtmlDetailsElement, HtmlInputElement};
 use yew::prelude::*;
 
-use crate::export::{
-    ExportFormat, ExportProgress, MergeInput, PacketFilter, export_filename, export_merged,
-    new_replay_uuid, trigger_download,
-};
+use crate::export::trigger_download;
 
 const PAGE_SIZE: usize = 200;
 
@@ -87,534 +79,46 @@ fn apply_theme(theme: Theme) {
     }
 }
 
-/// 表示行のイベント種別。論理イベント層の [`ReplayEvent`] のうち
-/// 表示に必要な部分のみを保持する。
-#[derive(Clone, PartialEq)]
-pub enum RowKind {
-    Packet { id: i32, state: State },
-    Custom { name: String },
-}
-
-#[derive(Clone, PartialEq)]
-pub struct EventRow {
-    pub time_ms: u64,
-    pub kind: RowKind,
-    pub size: usize,
-}
-
-/// フィルタ対象の行カテゴリ。パケットは state ごと、Custom は一括。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Category {
-    State(State),
-    Custom,
-}
-
-impl Category {
-    /// トグル UI の表示順 (接続フェーズ順 + Custom)。
-    const ORDER: [Category; 6] = [
-        Category::State(State::Handshaking),
-        Category::State(State::Status),
-        Category::State(State::Login),
-        Category::State(State::Configuration),
-        Category::State(State::Play),
-        Category::Custom,
-    ];
-
-    fn of(kind: &RowKind) -> Category {
-        match kind {
-            RowKind::Packet { state, .. } => Category::State(*state),
-            RowKind::Custom { .. } => Category::Custom,
-        }
-    }
-
-    /// カテゴリビット集合 ([`EventFilter::hidden`] 等) 内のビット。
-    fn bit(&self) -> u8 {
-        match self {
-            Category::State(State::Handshaking) => 1 << 0,
-            Category::State(State::Status) => 1 << 1,
-            Category::State(State::Login) => 1 << 2,
-            Category::State(State::Configuration) => 1 << 3,
-            Category::State(State::Play) => 1 << 4,
-            Category::Custom => 1 << 5,
-        }
-    }
-
-    fn label(&self) -> &'static str {
-        match self {
-            Category::State(s) => state_name(*s),
-            Category::Custom => "Custom",
-        }
-    }
-}
-
-/// イベントテーブルの表示フィルタ。
-/// (PartialEq は indices を導出する use_memo の依存キーとして使う)
-#[derive(Clone, PartialEq, Default)]
-struct EventFilter {
-    /// 非表示カテゴリのビット集合 ([`Category::bit`]、0 = 全表示)。
-    hidden: u8,
-    /// イベント検索クエリ (入力欄の原文)。
-    query: String,
-    /// query の 16 進 packet id 解釈 (マッチ用キャッシュ)。
-    query_id: Option<i32>,
-    /// query の小文字化 (Custom 名マッチ用キャッシュ)。
-    query_lower: String,
-}
-
-impl EventFilter {
-    fn with_query(&self, query: String) -> Self {
-        Self {
-            hidden: self.hidden,
-            query_id: parse_packet_id(&query),
-            query_lower: query.trim().to_lowercase(),
-            query,
-        }
-    }
-
-    fn with_toggled(&self, category: Category) -> Self {
-        Self {
-            hidden: self.hidden ^ category.bit(),
-            ..self.clone()
-        }
-    }
-
-    fn is_hidden(&self, category: Category) -> bool {
-        self.hidden & category.bit() != 0
-    }
-
-    fn is_empty(&self) -> bool {
-        self.hidden == 0 && self.query_lower.is_empty()
-    }
-
-    /// クエリは「event 列の表示」へのマッチ:
-    /// 16 進として解釈できれば packet id の一致、Custom は常に名前の部分一致。
-    fn matches(&self, row: &EventRow) -> bool {
-        if self.is_hidden(Category::of(&row.kind)) {
-            return false;
-        }
-        if self.query_lower.is_empty() {
-            return true;
-        }
-        match &row.kind {
-            RowKind::Packet { id, .. } => self.query_id == Some(*id),
-            RowKind::Custom { name } => name.contains(&self.query_lower),
-        }
-    }
-}
-
-/// ソート対象のカラム。
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum SortKey {
-    Index,
-    Time,
-    Event,
-    State,
-    Size,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum SortDir {
-    Asc,
-    Desc,
-}
-
-/// event 列の全順序: packet (id 順) → custom (名前順)。
-fn event_ord(a: &RowKind, b: &RowKind) -> Ordering {
-    match (a, b) {
-        (RowKind::Packet { id: a, .. }, RowKind::Packet { id: b, .. }) => a.cmp(b),
-        (RowKind::Custom { name: a }, RowKind::Custom { name: b }) => a.cmp(b),
-        (RowKind::Packet { .. }, RowKind::Custom { .. }) => Ordering::Less,
-        (RowKind::Custom { .. }, RowKind::Packet { .. }) => Ordering::Greater,
-    }
-}
-
-/// `indices` (元 index 昇順) をカラム値で並べ替える。
-/// 安定ソートのため同値は記録順を保つ (Desc は全体の反転)。
-fn sort_indices(events: &[EventRow], indices: &mut [usize], key: SortKey, dir: SortDir) {
-    match key {
-        SortKey::Index => {}
-        SortKey::Time => indices.sort_by_key(|&i| events[i].time_ms),
-        SortKey::Event => indices.sort_by(|&a, &b| event_ord(&events[a].kind, &events[b].kind)),
-        SortKey::State => indices.sort_by_key(|&i| Category::of(&events[i].kind).bit()),
-        SortKey::Size => indices.sort_by_key(|&i| events[i].size),
-    }
-    if dir == SortDir::Desc {
-        indices.reverse();
-    }
-}
-
-#[derive(Clone, PartialEq)]
-pub struct Loaded {
-    pub filename: String,
-    pub format: &'static str,
-    pub info: ReplayInfo,
-    pub events: Rc<Vec<EventRow>>,
-    /// リプレイ中に出現するカテゴリ (トグル UI 用、読み込み時に集計)。
-    pub categories: Vec<Category>,
-}
-
-/// ファイルエントリの読み込み状態。
-#[derive(Clone)]
-enum EntryState {
-    Loading,
-    /// パース後は不変。Rc は merge の use_memo 依存キー (ポインタ比較) も兼ねる。
-    /// `bytes` は元ファイルの生バイト列で、書き出し時の再パースに使う
-    /// (表示行 [`EventRow`] はパケット body を持たないため)。
-    Loaded {
-        loaded: Rc<Loaded>,
-        bytes: Rc<Vec<u8>>,
-    },
-    Error(String),
-}
-
-/// 連結リストの 1 エントリの中身。ファイルと interval を同列に並べる。
-#[derive(Clone)]
-enum EntryKind {
-    File {
-        filename: String,
-        state: EntryState,
-        /// 再生速度倍率の入力原文。空/不正値は書き出し時にエラーにする。
-        speed_input: String,
-    },
-    /// 連結時に直前までのタイムラインへ加算する空白。入力欄の原文を保持し、
-    /// parse 失敗は 0 扱い (旧 interval 入力欄と同じ方針)。
-    Interval { input: String },
-}
-
-/// 連結リストの 1 エントリ。`id` は発番順の安定キー
-/// (Yew の key、読み込み中 FileReader の管理、DnD の並べ替えに使う)。
-#[derive(Clone)]
-struct Entry {
-    id: u64,
-    kind: EntryKind,
-}
-
-/// ファイルと interval の順序付きリスト。
-/// 複数の読み込み完了が並行して届くため、クロージャに古い状態を
-/// キャプチャしない reducer ([`FilesAction`]) で更新する。
+/// [`FilesState`] を Yew の [`Reducible`] で包む器。状態遷移の本体は
+/// UI 非依存の [`FilesState::reduce`] にあり、ここでは Yew のフックに
+/// 適合させるだけ (orphan rule のため共有クレート側に impl できない)。
 #[derive(Default)]
-struct FilesState {
-    entries: Vec<Entry>,
+struct Files(FilesState);
+
+impl std::ops::Deref for Files {
+    type Target = FilesState;
+    fn deref(&self) -> &FilesState {
+        &self.0
+    }
 }
 
-enum FilesAction {
-    /// 読み込み開始 (Loading のファイルエントリを末尾へ追加)。
-    Add {
-        id: u64,
-        filename: String,
-    },
-    /// 読み込み・パース完了。完了前に削除されていたら no-op。
-    Finish {
-        id: u64,
-        result: Result<(Rc<Loaded>, Rc<Vec<u8>>), String>,
-    },
-    /// interval エントリを末尾へ追加。
-    AddInterval {
-        id: u64,
-        input: String,
-    },
-    /// 既存 interval の値を差し替える (ダイアログ編集)。
-    SetInterval {
-        id: u64,
-        input: String,
-    },
-    /// 既存ファイルの速度倍率を差し替える。
-    SetSpeed {
-        id: u64,
-        input: String,
-    },
-    Remove {
-        id: u64,
-    },
-    Reorder {
-        dragged_id: u64,
-        target_id: u64,
-    },
-}
-
-impl Reducible for FilesState {
+impl Reducible for Files {
     type Action = FilesAction;
-
     fn reduce(self: Rc<Self>, action: FilesAction) -> Rc<Self> {
-        // Entry の clone は Rc + String のみで軽量。
-        let mut entries = self.entries.clone();
-        match action {
-            FilesAction::Add { id, filename } => entries.push(Entry {
-                id,
-                kind: EntryKind::File {
-                    filename,
-                    state: EntryState::Loading,
-                    speed_input: "1".to_string(),
-                },
-            }),
-            FilesAction::Finish { id, result } => {
-                if let Some(EntryKind::File { state, .. }) =
-                    entries.iter_mut().find(|e| e.id == id).map(|e| &mut e.kind)
-                {
-                    *state = match result {
-                        Ok((loaded, bytes)) => EntryState::Loaded { loaded, bytes },
-                        Err(msg) => EntryState::Error(msg),
-                    };
-                }
-            }
-            FilesAction::AddInterval { id, input } => entries.push(Entry {
-                id,
-                kind: EntryKind::Interval { input },
-            }),
-            FilesAction::SetInterval { id, input } => {
-                if let Some(EntryKind::Interval { input: slot }) =
-                    entries.iter_mut().find(|e| e.id == id).map(|e| &mut e.kind)
-                {
-                    *slot = input;
-                }
-            }
-            FilesAction::SetSpeed { id, input } => {
-                if let Some(EntryKind::File { speed_input, .. }) =
-                    entries.iter_mut().find(|e| e.id == id).map(|e| &mut e.kind)
-                {
-                    *speed_input = input;
-                }
-            }
-            FilesAction::Remove { id } => entries.retain(|e| e.id != id),
-            FilesAction::Reorder {
-                dragged_id,
-                target_id,
-            } => {
-                if dragged_id != target_id
-                    && let Some(from) = entries.iter().position(|e| e.id == dragged_id)
-                    && let Some(to) = entries.iter().position(|e| e.id == target_id)
-                {
-                    let entry = entries.remove(from);
-                    entries.insert(to.min(entries.len()), entry);
-                }
-            }
-        }
-        Rc::new(FilesState { entries })
+        Rc::new(Files(self.0.reduce(action)))
     }
 }
 
-/// 1 ファイル分のパケット採否。デフォルト全採用を O(1) で表すため、全体の
-/// 既定 (`base`) と、それに反する元イベント index の集合 (`flipped`) で持つ。
-/// 採否は `base ^ flipped.contains(index)`。これにより全選択/全解除は
-/// `flipped` を空にするだけで済み、巨大なイベント列でも軽い。
-#[derive(Clone)]
-pub struct PacketSelection {
-    base: bool,
-    flipped: HashSet<usize>,
-}
-
-impl Default for PacketSelection {
-    fn default() -> Self {
-        // 既定は全採用。
-        Self {
-            base: true,
-            flipped: HashSet::new(),
-        }
-    }
-}
-
-impl PacketSelection {
-    fn is_on(&self, index: usize) -> bool {
-        self.base ^ self.flipped.contains(&index)
-    }
-
-    /// 1 件の採否を反転する。
-    fn toggle(&mut self, index: usize) {
-        if !self.flipped.insert(index) {
-            self.flipped.remove(&index);
-        }
-    }
-
-    /// 全件を一括採否する。
-    fn set_all(&mut self, on: bool) {
-        self.base = on;
-        self.flipped.clear();
-    }
-
-    /// 指定した複数件をまとめて `on` に揃える (ドラッグ範囲選択の一括 On/Off)。
-    /// 採否は `base ^ flipped.contains` なので、`on == base` の側は flipped から
-    /// 外し、反対側は flipped に入れるだけで済む。
-    fn set_many(&mut self, indices: &HashSet<usize>, on: bool) {
-        if on == self.base {
-            for i in indices {
-                self.flipped.remove(i);
-            }
-        } else {
-            for &i in indices {
-                self.flipped.insert(i);
-            }
-        }
-    }
-
-    /// 採用件数 (`total` は対象ファイルの全イベント数)。
-    fn on_count(&self, total: usize) -> usize {
-        if self.base {
-            total.saturating_sub(self.flipped.len())
-        } else {
-            self.flipped.len()
-        }
-    }
-}
-
-impl PacketFilter for PacketSelection {
-    fn keep(&self, index: usize) -> bool {
-        self.is_on(index)
-    }
-}
-
-/// パケット選択をファイル id 単位で持つ。エントリの無いファイルは全採用扱い。
-/// 値は Rc にして [`LoadedViewProps`] の再描画判定をポインタ比較で行う。
+/// [`SelectionState`] を Yew の [`Reducible`] で包む器 ([`Files`] と同様)。
 #[derive(Default)]
-struct SelectionState {
-    by_file: HashMap<u64, Rc<PacketSelection>>,
+struct Selection(SelectionState);
+
+impl std::ops::Deref for Selection {
+    type Target = SelectionState;
+    fn deref(&self) -> &SelectionState {
+        &self.0
+    }
 }
 
-enum SelectionAction {
-    /// 1 パケットの採否を反転。
-    Toggle { file_id: u64, index: usize },
-    /// 対象ファイルの全パケットを一括採否。
-    SetAll { file_id: u64, on: bool },
-    /// ドラッグ範囲選択した複数パケットをまとめて採否。
-    SetMany {
-        file_id: u64,
-        indices: Rc<HashSet<usize>>,
-        on: bool,
-    },
-    /// ファイル削除時に選択も捨てる。
-    Remove { file_id: u64 },
-}
-
-impl Reducible for SelectionState {
+impl Reducible for Selection {
     type Action = SelectionAction;
-
     fn reduce(self: Rc<Self>, action: SelectionAction) -> Rc<Self> {
-        // by_file は Rc のマップで clone は軽量。更新するファイルの中身だけ複製する。
-        let mut by_file = self.by_file.clone();
-        match action {
-            SelectionAction::Toggle { file_id, index } => {
-                let mut sel = by_file
-                    .get(&file_id)
-                    .map_or_else(PacketSelection::default, |s| (**s).clone());
-                sel.toggle(index);
-                by_file.insert(file_id, Rc::new(sel));
-            }
-            SelectionAction::SetAll { file_id, on } => {
-                let mut sel = by_file
-                    .get(&file_id)
-                    .map_or_else(PacketSelection::default, |s| (**s).clone());
-                sel.set_all(on);
-                by_file.insert(file_id, Rc::new(sel));
-            }
-            SelectionAction::SetMany {
-                file_id,
-                indices,
-                on,
-            } => {
-                let mut sel = by_file
-                    .get(&file_id)
-                    .map_or_else(PacketSelection::default, |s| (**s).clone());
-                sel.set_many(&indices, on);
-                by_file.insert(file_id, Rc::new(sel));
-            }
-            SelectionAction::Remove { file_id } => {
-                by_file.remove(&file_id);
-            }
-        }
-        Rc::new(SelectionState { by_file })
+        Rc::new(Selection(self.0.reduce(action)))
     }
-}
-
-fn state_name(s: State) -> &'static str {
-    match s {
-        State::Handshaking => "Handshaking",
-        State::Status => "Status",
-        State::Login => "Login",
-        State::Configuration => "Config",
-        State::Play => "Play",
-    }
-}
-
-/// 行列中に出現するカテゴリを表示順 ([`Category::ORDER`]) で集計する。
-pub(crate) fn categories_of(rows: &[EventRow]) -> Vec<Category> {
-    let mut seen = 0u8;
-    for row in rows {
-        seen |= Category::of(&row.kind).bit();
-    }
-    Category::ORDER
-        .iter()
-        .copied()
-        .filter(|c| seen & c.bit() != 0)
-        .collect()
-}
-
-/// 論理イベント列を表示用の行へ読み出し、出現カテゴリも集計する。
-fn collect_events<S: EventSource>(
-    mut source: S,
-) -> anyhow::Result<(ReplayInfo, Vec<EventRow>, Vec<Category>)> {
-    let info = source.info().clone();
-    let rows = source
-        .events()
-        .map(|event| {
-            event.map(|event| {
-                let (time, kind, size) = match event {
-                    ReplayEvent::Packet {
-                        time,
-                        state,
-                        id,
-                        data,
-                    } => (time, RowKind::Packet { id, state }, data.len()),
-                    ReplayEvent::Custom { time, name, data } => {
-                        (time, RowKind::Custom { name }, data.len())
-                    }
-                };
-                EventRow {
-                    time_ms: time.as_millis(),
-                    kind,
-                    size,
-                }
-            })
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    let categories = categories_of(&rows);
-    Ok((info, rows, categories))
-}
-
-fn parse_replay(filename: String, bytes: &[u8]) -> anyhow::Result<Loaded> {
-    let mut zip = ZipArchiveReader::new(Cursor::new(bytes))?;
-    let format = detect_format(&mut zip)?;
-    // McprEventSource は reader を借用するため、match の外で生かす
-    let mut mcpr_reader;
-    let source: Box<dyn EventSource + '_> = match format {
-        ReplayFormat::ReplayMod => {
-            mcpr_reader = ReplayReader::new(zip);
-            Box::new(mcpr_reader.event_source()?)
-        }
-        ReplayFormat::Flashback => Box::new(FlashbackReader::new(zip).event_source(true)?),
-    };
-    let (info, rows, categories) = collect_events(source)?;
-    Ok(Loaded {
-        filename,
-        format: format.name(),
-        info,
-        events: Rc::new(rows),
-        categories,
-    })
 }
 
 fn file_list_to_vec(files: &web_sys::FileList) -> Vec<web_sys::File> {
     (0..files.length()).filter_map(|i| files.get(i)).collect()
-}
-
-/// 書き出しの進行状態 (進捗バー表示用)。None = 書き出し中でない。
-#[derive(Clone, Copy, PartialEq)]
-enum ExportPhase {
-    /// zip 再パースなど、まだイベント処理件数を出せない開始直後。
-    Preparing,
-    /// イベント処理中。total はパース済み表示行数の合計
-    /// (export は同じソースを再パースするため一致する)。
-    Events { done: u64, total: u64 },
-    /// zip 圧縮・メタデータ書き込み中 (一括で走るため進捗は刻めない)。
-    Finishing,
 }
 
 /// interval 入力ダイアログの開閉と対象。`Add` は新規追加、`Edit(id)` は
@@ -633,31 +137,13 @@ enum SpeedDialog {
     Edit(u64),
 }
 
-/// 書き出し用に並び順のまま組む所有エントリ。借用版 [`MergeInput`] と違い、
-/// Replay は Rc を保持して async タスクへ move できる。
-enum OwnedItem {
-    Replay {
-        bytes: Rc<Vec<u8>>,
-        selection: Rc<PacketSelection>,
-        speed: PlaybackSpeed,
-    },
-    Interval(u64),
-}
-
-fn speed_label(input: &str) -> String {
-    match input.trim().parse::<PlaybackSpeed>() {
-        Ok(speed) => format!("{speed}x"),
-        Err(_) => "invalid".to_string(),
-    }
-}
-
 #[function_component]
 pub fn App() -> Html {
-    let files = use_reducer(FilesState::default);
+    let files = use_reducer(Files::default);
     // パケット採否 (ファイル id 単位)。エントリの無いファイルは全採用。
-    let selection = use_reducer(SelectionState::default);
+    let selection = use_reducer(Selection::default);
     // 未編集ファイルへ渡す全採用の既定値。ポインタを安定させ無駄な再描画を避ける。
-    let empty_selection = use_state(|| Rc::new(PacketSelection::default()));
+    let empty_selection = use_state(|| Arc::new(PacketSelection::default()));
     let selected_file_id = use_state(|| Option::<u64>::None);
     let dragging_file_id = use_state(|| Option::<u64>::None);
     let drop_target_file_id = use_state(|| Option::<u64>::None);
@@ -715,9 +201,9 @@ pub fn App() -> Html {
                     let result = match result {
                         Ok(bytes) => {
                             // 書き出し時の再パース用に生バイト列も保持する。
-                            let bytes = Rc::new(bytes);
+                            let bytes = Arc::new(bytes);
                             parse_replay(filename, &bytes)
-                                .map(|loaded| (Rc::new(loaded), bytes))
+                                .map(|loaded| (Arc::new(loaded), bytes))
                                 .map_err(|e| format!("parse error: {e}"))
                         }
                         Err(e) => Err(format!("read error: {e:?}")),
@@ -883,22 +369,11 @@ pub fn App() -> Html {
         Callback::from(move |_: MouseEvent| speed_dialog.set(SpeedDialog::Closed))
     };
 
-    // Loaded なファイルだけを選択対象にする (interval は対象外)。
-    let find_loaded = |want: Option<u64>| {
-        files.entries.iter().find_map(|entry| match &entry.kind {
-            EntryKind::File {
-                state: EntryState::Loaded { loaded, .. },
-                speed_input,
-                ..
-            } if want.is_none_or(|id| entry.id == id) => {
-                Some((entry.id, loaded.clone(), speed_input.clone()))
-            }
-            _ => None,
-        })
-    };
-    let selected_file = (*selected_file_id)
-        .and_then(|selected_id| find_loaded(Some(selected_id)))
-        .or_else(|| find_loaded(None));
+    // 表示中の Loaded ファイル (選択中、なければ先頭)。共有ロジックが返す借用を
+    // 下流で move する行があるため、ここで owned へ複製する。
+    let selected_file = files
+        .active_loaded(*selected_file_id)
+        .map(|(id, loaded, speed_input)| (id, loaded.clone(), speed_input.to_string()));
     let active_file_id = selected_file.as_ref().map(|(id, _, _)| *id);
 
     let on_remove_file = {
@@ -1101,21 +576,12 @@ pub fn App() -> Html {
 
     // Export は全ファイルの読み込み完了時のみ許可する (interval は阻害しない、
     // ファイルが 1 件も無ければ書き出すものが無い)。
-    let file_count = files
-        .entries
-        .iter()
-        .filter(|e| matches!(e.kind, EntryKind::File { .. }))
-        .count();
-    let all_loaded = file_count > 0
-        && files.entries.iter().all(|e| match &e.kind {
-            EntryKind::File { state, .. } => matches!(state, EntryState::Loaded { .. }),
-            EntryKind::Interval { .. } => true,
-        });
+    let file_count = files.file_count();
+    let all_loaded = files.all_loaded();
 
     let on_export = {
         let files = files.clone();
         let selection = selection.clone();
-        let empty_selection = empty_selection.clone();
         let export_phase = export_phase.clone();
         let export_error = export_error.clone();
         let format = *export_format;
@@ -1123,49 +589,21 @@ pub fn App() -> Html {
             if export_phase.is_some() {
                 return;
             }
-            // 並び順のまま所有列を組む。Replay は Rc を持って async ブロックへ move し、
-            // 借用ビュー (&[MergeInput]) は move 後にブロック内で作る (借用がダングらない)。
-            let mut owned: Vec<OwnedItem> = Vec::new();
-            let mut total = 0u64;
-            let mut first_filename: Option<String> = None;
-            let mut file_count = 0usize;
-            for entry in &files.entries {
-                match &entry.kind {
-                    EntryKind::File {
-                        filename,
-                        state: EntryState::Loaded { loaded, bytes },
-                        speed_input,
-                    } => {
-                        let speed = match speed_input.trim().parse::<PlaybackSpeed>() {
-                            Ok(speed) => speed,
-                            Err(e) => {
-                                export_error.set(Some(format!("speed error: {e}")));
-                                return;
-                            }
-                        };
-                        total += loaded.events.len() as u64;
-                        first_filename.get_or_insert_with(|| filename.clone());
-                        file_count += 1;
-                        let sel = selection
-                            .by_file
-                            .get(&entry.id)
-                            .cloned()
-                            .unwrap_or_else(|| (*empty_selection).clone());
-                        owned.push(OwnedItem::Replay {
-                            bytes: bytes.clone(),
-                            selection: sel,
-                            speed,
-                        });
-                    }
-                    // ボタンの disabled と同条件の保険 (全ファイル Loaded のときだけ)。
-                    EntryKind::File { .. } => return,
-                    EntryKind::Interval { input } => {
-                        owned.push(OwnedItem::Interval(input.trim().parse().unwrap_or(0)));
-                    }
+            // ファイルリストと採否から連結入力を組む (mcpr-app の純関数)。Replay は
+            // Arc を持って async ブロックへ move し、借用ビュー (&[MergeInput]) は
+            // move 後にブロック内で作る (借用がダングらない)。
+            let ExportPlan {
+                items: owned,
+                total_events: total,
+                first_filename,
+                file_count,
+            } = match build_export_plan(&files, &selection) {
+                Ok(Some(plan)) => plan,
+                Ok(None) => return,
+                Err(msg) => {
+                    export_error.set(Some(msg));
+                    return;
                 }
-            }
-            let Some(first_filename) = first_filename else {
-                return;
             };
             let filename = export_filename(&first_filename, file_count > 1, format);
             export_phase.set(Some(ExportPhase::Preparing));
@@ -1175,31 +613,11 @@ pub fn App() -> Html {
             // export_merged は一定イベント数ごとにブラウザへ yield するため、
             // async タスクとして流せば書き出し中も進捗バーが再描画される。
             yew::platform::spawn_local(async move {
-                let items: Vec<MergeInput> = owned
-                    .iter()
-                    .map(|it| match it {
-                        OwnedItem::Replay {
-                            bytes,
-                            selection,
-                            speed,
-                        } => MergeInput::Replay {
-                            bytes: bytes.as_slice(),
-                            filter: Some(selection.as_ref() as &dyn PacketFilter),
-                            speed: *speed,
-                        },
-                        OwnedItem::Interval(ms) => MergeInput::Interval(*ms),
-                    })
-                    .collect();
+                let items = as_merge_inputs(&owned);
                 let on_progress = {
                     let export_phase = export_phase.clone();
                     move |progress| {
-                        export_phase.set(Some(match progress {
-                            ExportProgress::Events { processed } => ExportPhase::Events {
-                                done: processed,
-                                total,
-                            },
-                            ExportProgress::Finishing => ExportPhase::Finishing,
-                        }));
+                        export_phase.set(Some(ExportPhase::from_progress(progress, total)));
                     }
                 };
                 let result = export_merged(&items, format, new_replay_uuid(), on_progress).await;
@@ -1240,11 +658,9 @@ pub fn App() -> Html {
         let (value, label) = match phase {
             ExportPhase::Preparing => (None, "準備中…".to_string()),
             ExportPhase::Events { done, total } => {
-                let clamped = if total == 0 { 0 } else { done.min(total) };
-                let percent = clamped
-                    .saturating_mul(100)
-                    .checked_div(total)
-                    .unwrap_or(if done == 0 { 0 } else { 100 });
+                // percent は共有ロジック (mcpr-app)、value 属性用の clamped は web 固有。
+                let clamped = done.min(total);
+                let percent = phase.percent().unwrap_or(0);
                 let label = if done > 0 && percent == 0 {
                     "<1%".to_string()
                 } else {
@@ -1311,7 +727,7 @@ pub fn App() -> Html {
     let on_set_many_packets = {
         let selection_dispatch = selection.dispatcher();
         Callback::from(
-            move |(file_id, indices, on): (u64, Rc<HashSet<usize>>, bool)| {
+            move |(file_id, indices, on): (u64, Arc<HashSet<usize>>, bool)| {
                 selection_dispatch.dispatch(SelectionAction::SetMany {
                     file_id,
                     indices,
@@ -1527,16 +943,16 @@ pub fn App() -> Html {
 #[derive(Properties)]
 struct LoadedViewProps {
     id: u64,
-    data: Rc<Loaded>,
+    data: Arc<Loaded>,
     speed_input: String,
     /// このファイルのパケット採否。
-    selection: Rc<PacketSelection>,
+    selection: Arc<PacketSelection>,
     /// (file_id, 元 index) で 1 件の採否を反転。
     on_toggle: Callback<(u64, usize)>,
     /// (file_id, on) で全件を一括採否。
     on_set_all: Callback<(u64, bool)>,
     /// (file_id, 元 index 集合, on) でドラッグ範囲選択した複数件をまとめて採否。
-    on_set_many: Callback<(u64, Rc<HashSet<usize>>, bool)>,
+    on_set_many: Callback<(u64, Arc<HashSet<usize>>, bool)>,
     on_edit_speed: Callback<(u64, String)>,
     on_remove: Callback<u64>,
 }
@@ -1546,19 +962,19 @@ struct LoadedViewProps {
 impl PartialEq for LoadedViewProps {
     fn eq(&self, other: &Self) -> bool {
         self.id == other.id
-            && Rc::ptr_eq(&self.data, &other.data)
+            && Arc::ptr_eq(&self.data, &other.data)
             && self.speed_input == other.speed_input
-            && Rc::ptr_eq(&self.selection, &other.selection)
+            && Arc::ptr_eq(&self.selection, &other.selection)
     }
 }
 
-/// use_memo の依存キー用に Rc をポインタ同一性で比較するラッパ。
+/// use_memo の依存キー用に Arc をポインタ同一性で比較するラッパ。
 /// (events の深い比較は数百万行に及ぶため避ける)
-struct RcPtr<T>(Rc<T>);
+struct ArcPtr<T>(Arc<T>);
 
-impl<T> PartialEq for RcPtr<T> {
+impl<T> PartialEq for ArcPtr<T> {
     fn eq(&self, other: &Self) -> bool {
-        Rc::ptr_eq(&self.0, &other.0)
+        Arc::ptr_eq(&self.0, &other.0)
     }
 }
 
@@ -1573,36 +989,13 @@ fn LoadedView(props: &LoadedViewProps) -> Html {
     // Some)、`marked` は選択済みの元 index 集合で、一括 On/Off の対象とハイライト表示に
     // 使う。export 採否 (`PacketSelection`) とは別概念の、UI だけの一時状態。
     let mark_anchor = use_state(|| Option::<usize>::None);
-    let marked = use_state(|| Rc::new(HashSet::<usize>::new()));
+    let marked = use_state(|| Arc::new(HashSet::<usize>::new()));
 
     // 表示する行の元 index 列 (None = 全行を記録順のまま)。
     // filter / sort / events が変わった時だけ全行を走査する。
     let indices = use_memo(
-        (RcPtr(props.data.events.clone()), (*filter).clone(), *sort),
-        |(events, filter, sort)| {
-            if filter.is_empty() && sort.is_none() {
-                return None;
-            }
-            let events = &events.0;
-            let mut matched: Vec<usize> = if filter.is_empty() {
-                (0..events.len()).collect()
-            } else {
-                let mut v = Vec::with_capacity(events.len());
-                v.extend(
-                    events
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, row)| filter.matches(row))
-                        .map(|(i, _)| i),
-                );
-                v.shrink_to_fit();
-                v
-            };
-            if let Some((key, dir)) = *sort {
-                sort_indices(events, &mut matched, key, dir);
-            }
-            Some(matched)
-        },
+        (ArcPtr(props.data.events.clone()), (*filter).clone(), *sort),
+        |(events, filter, sort)| compute_indices(&events.0, filter, *sort),
     );
     let indices: &Option<Vec<usize>> = &indices;
 
@@ -1761,7 +1154,7 @@ fn LoadedView(props: &LoadedViewProps) -> Html {
         let marked = marked.clone();
         Callback::from(move |_: MouseEvent| {
             mark_anchor.set(None);
-            marked.set(Rc::new(HashSet::new()));
+            marked.set(Arc::new(HashSet::new()));
         })
     };
     let on_mark_on = {
@@ -1804,7 +1197,7 @@ fn LoadedView(props: &LoadedViewProps) -> Html {
                 Callback::from(move |e: MouseEvent| {
                     e.prevent_default();
                     mark_anchor.set(Some(pi));
-                    marked.set(Rc::new(HashSet::from([orig])));
+                    marked.set(Arc::new(HashSet::from([orig])));
                 })
             };
             // ドラッグ中に別の行へ入ったら、アンカーからその行までを選択し直す。
@@ -1828,7 +1221,7 @@ fn LoadedView(props: &LoadedViewProps) -> Html {
                         (pi, anchor)
                     };
                     let set: HashSet<usize> = page_orig[lo..=hi].iter().copied().collect();
-                    marked.set(Rc::new(set));
+                    marked.set(Arc::new(set));
                 })
             };
             let (event, state) = match &row.kind {
@@ -2007,267 +1400,5 @@ fn MetaRow(props: &MetaRowProps) -> Html {
             <span class="mcpr-meta-label">{ props.label }{ ":" }</span>
             <span class="font-mono text-base-content truncate">{ &props.value }</span>
         </div>
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn packet(id: i32, state: State) -> EventRow {
-        EventRow {
-            time_ms: 0,
-            kind: RowKind::Packet { id, state },
-            size: 0,
-        }
-    }
-
-    fn custom(name: &str) -> EventRow {
-        EventRow {
-            time_ms: 0,
-            kind: RowKind::Custom {
-                name: name.to_string(),
-            },
-            size: 0,
-        }
-    }
-
-    fn loading_file(id: u64) -> Entry {
-        Entry {
-            id,
-            kind: EntryKind::File {
-                filename: format!("{id}.mcpr"),
-                state: EntryState::Loading,
-                speed_input: "1".to_string(),
-            },
-        }
-    }
-
-    fn interval_entry(id: u64, input: &str) -> Entry {
-        Entry {
-            id,
-            kind: EntryKind::Interval {
-                input: input.to_string(),
-            },
-        }
-    }
-
-    fn entry_ids(state: &FilesState) -> Vec<u64> {
-        state.entries.iter().map(|entry| entry.id).collect()
-    }
-
-    #[test]
-    fn file_reorder_moves_dragged_entry_to_drop_target_boundary() {
-        let state = Rc::new(FilesState {
-            entries: vec![loading_file(1), loading_file(2), loading_file(3)],
-        });
-
-        let state = state.reduce(FilesAction::Reorder {
-            dragged_id: 1,
-            target_id: 3,
-        });
-        assert_eq!(entry_ids(&state), vec![2, 3, 1]);
-
-        let state = state.reduce(FilesAction::Reorder {
-            dragged_id: 1,
-            target_id: 2,
-        });
-        assert_eq!(entry_ids(&state), vec![1, 2, 3]);
-    }
-
-    #[test]
-    fn interval_reorders_among_files_like_a_file() {
-        // ファイル・ファイル・interval を並べ、interval を id ベースで先頭へ。
-        let state = Rc::new(FilesState {
-            entries: vec![loading_file(1), loading_file(2), interval_entry(3, "500")],
-        });
-
-        let state = state.reduce(FilesAction::Reorder {
-            dragged_id: 3,
-            target_id: 1,
-        });
-        assert_eq!(entry_ids(&state), vec![3, 1, 2]);
-    }
-
-    #[test]
-    fn set_interval_updates_only_matching_interval() {
-        let state = Rc::new(FilesState {
-            entries: vec![loading_file(1), interval_entry(2, "500")],
-        });
-
-        let state = state.reduce(FilesAction::SetInterval {
-            id: 2,
-            input: "1200".to_string(),
-        });
-
-        let inputs: Vec<Option<&str>> = state
-            .entries
-            .iter()
-            .map(|e| match &e.kind {
-                EntryKind::Interval { input } => Some(input.as_str()),
-                EntryKind::File { .. } => None,
-            })
-            .collect();
-        assert_eq!(inputs, vec![None, Some("1200")]);
-    }
-
-    #[test]
-    fn set_speed_updates_only_matching_file() {
-        let state = Rc::new(FilesState {
-            entries: vec![loading_file(1), interval_entry(2, "500")],
-        });
-
-        let state = state.reduce(FilesAction::SetSpeed {
-            id: 1,
-            input: "2".to_string(),
-        });
-
-        let speeds: Vec<Option<&str>> = state
-            .entries
-            .iter()
-            .map(|e| match &e.kind {
-                EntryKind::File { speed_input, .. } => Some(speed_input.as_str()),
-                EntryKind::Interval { .. } => None,
-            })
-            .collect();
-        assert_eq!(speeds, vec![Some("2"), None]);
-    }
-
-    #[test]
-    fn set_many_flips_only_listed_indices_to_target() {
-        // 既定 (全採用) から一部を Off にし、別の集合を On に戻す。
-        let mut sel = PacketSelection::default();
-        sel.set_many(&HashSet::from([1, 3, 5]), false);
-        assert!(sel.is_on(0));
-        assert!(!sel.is_on(1));
-        assert!(!sel.is_on(3));
-        assert!(!sel.is_on(5));
-        assert_eq!(sel.on_count(6), 3);
-
-        // 3 と 5 を On に戻すと 1 だけ Off のまま。
-        sel.set_many(&HashSet::from([3, 5]), true);
-        assert!(sel.is_on(3));
-        assert!(sel.is_on(5));
-        assert!(!sel.is_on(1));
-        assert_eq!(sel.on_count(6), 5);
-    }
-
-    #[test]
-    fn set_many_on_after_set_all_off_selects_listed() {
-        // 全 Off の土台 (base=false) から指定だけ On にする。
-        let mut sel = PacketSelection::default();
-        sel.set_all(false);
-        sel.set_many(&HashSet::from([2, 4]), true);
-        assert!(sel.is_on(2));
-        assert!(sel.is_on(4));
-        assert!(!sel.is_on(0));
-        assert_eq!(sel.on_count(5), 2);
-    }
-
-    #[test]
-    fn default_filter_shows_everything() {
-        let f = EventFilter::default();
-        assert!(f.is_empty());
-        assert!(f.matches(&packet(0x2c, State::Play)));
-        assert!(f.matches(&custom("flashback:action/move_entities")));
-    }
-
-    #[test]
-    fn hidden_category_drops_rows() {
-        let f = EventFilter::default().with_toggled(Category::State(State::Play));
-        assert!(!f.matches(&packet(0x2c, State::Play)));
-        assert!(f.matches(&packet(0x07, State::Configuration)));
-        assert!(f.matches(&custom("flashback:action/move_entities")));
-        // 再トグルで元に戻る
-        let f = f.with_toggled(Category::State(State::Play));
-        assert!(f.is_empty());
-    }
-
-    #[test]
-    fn hex_query_matches_packet_id() {
-        for q in ["0x2c", "2c", " 0x2C "] {
-            let f = EventFilter::default().with_query(q.to_string());
-            assert!(f.matches(&packet(0x2c, State::Play)), "query {q:?}");
-            assert!(!f.matches(&packet(0x2b, State::Play)), "query {q:?}");
-        }
-    }
-
-    #[test]
-    fn text_query_matches_custom_name_case_insensitive() {
-        for q in ["move", "MOVE"] {
-            let f = EventFilter::default().with_query(q.to_string());
-            assert!(f.matches(&custom("flashback:action/move_entities")));
-            assert!(!f.matches(&custom("flashback:action/next_tick")));
-            // 16 進として解釈できないクエリはパケットに一致しない
-            assert!(!f.matches(&packet(0x2c, State::Play)));
-        }
-    }
-
-    #[test]
-    fn query_and_category_combine() {
-        let f = EventFilter::default()
-            .with_toggled(Category::State(State::Play))
-            .with_query("0x07".to_string());
-        // クエリは一致するがカテゴリが非表示
-        assert!(!f.matches(&packet(0x07, State::Play)));
-        assert!(f.matches(&packet(0x07, State::Configuration)));
-    }
-
-    fn sorted(events: &[EventRow], key: SortKey, dir: SortDir) -> Vec<usize> {
-        let mut indices: Vec<usize> = (0..events.len()).collect();
-        sort_indices(events, &mut indices, key, dir);
-        indices
-    }
-
-    #[test]
-    fn sort_by_time_is_stable() {
-        let mut events = vec![
-            packet(0x01, State::Play),
-            packet(0x02, State::Play),
-            packet(0x03, State::Play),
-        ];
-        events[0].time_ms = 100;
-        // index 1, 2 は同時刻 → 記録順を保つ
-        events[1].time_ms = 50;
-        events[2].time_ms = 50;
-        assert_eq!(sorted(&events, SortKey::Time, SortDir::Asc), vec![1, 2, 0]);
-        assert_eq!(sorted(&events, SortKey::Time, SortDir::Desc), vec![0, 2, 1]);
-    }
-
-    #[test]
-    fn sort_by_event_orders_packets_before_customs() {
-        let events = vec![
-            custom("flashback:action/move_entities"),
-            packet(0x2c, State::Play),
-            custom("flashback:action/accurate_player_position"),
-            packet(0x07, State::Configuration),
-        ];
-        // packet (id 順) → custom (名前順)
-        assert_eq!(
-            sorted(&events, SortKey::Event, SortDir::Asc),
-            vec![3, 1, 2, 0]
-        );
-    }
-
-    #[test]
-    fn sort_by_state_follows_phase_order() {
-        let events = vec![
-            custom("flashback:action/move_entities"),
-            packet(0x2c, State::Play),
-            packet(0x02, State::Login),
-            packet(0x07, State::Configuration),
-        ];
-        // Login → Config → Play → Custom
-        assert_eq!(
-            sorted(&events, SortKey::State, SortDir::Asc),
-            vec![2, 3, 1, 0]
-        );
-    }
-
-    #[test]
-    fn sort_by_index_desc_reverses() {
-        let events = vec![packet(0x01, State::Play), packet(0x02, State::Play)];
-        assert_eq!(sorted(&events, SortKey::Index, SortDir::Asc), vec![0, 1]);
-        assert_eq!(sorted(&events, SortKey::Index, SortDir::Desc), vec![1, 0]);
     }
 }
