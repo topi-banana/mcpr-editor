@@ -1,3 +1,9 @@
+// Windows のリリースビルドでは GUI とは別にコンソール窓が開くのを抑止する
+// (既定の console サブシステムを windows サブシステムへ切り替える)。
+// debug ビルドでは残して起動ログ (WSL/X11 まわり等) を見えるようにする。
+// この属性は Windows 以外では無視されるため cfg でのプラットフォーム分岐は不要。
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 //! mcpr-gpui: gpui + gpui-component による native UI。
 //!
 //! アプリロジック(連結・書き出し・フィルタ・状態遷移)は `mcpr-app` を通じて
