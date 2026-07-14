@@ -1,0 +1,32 @@
+[package]
+name = "mcpr-gpui"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# UI 非依存のアプリロジック (mcpr-ui と共有)。
+mcpr-app = { path = "../mcpr-app" }
+mcpr-lib = { path = "../mcpr-lib", default-features = false }
+anyhow = "1.0"
+futures = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+dirs = "6"
+
+# gpui は zed モノレポ内 (crates/gpui)。pre-1.0 で API 変動が激しいため git 依存。
+# gpui-component と同じ「rev 無し git」宣言にしてソースを一本化し (rev を付けると
+# 別ソース扱いで gpui が二重化し型不一致になる)、実 commit は Cargo.lock で固定する:
+#   cargo update -p gpui --precise <zed-commit>
+# 揃える zed-commit は gpui-component の同梱 Cargo.lock が指すもの。
+gpui = { git = "https://github.com/zed-industries/zed" }
+# x11 のみ (wayland を外して libwayland-dev を不要にする)。WSL2 は Wayland が
+# 不安定なため X11 強制が推奨で、native Linux でも XWayland 経由で動く。
+# Wayland ネイティブが要るなら "wayland" を足し libwayland-dev を入れる。
+gpui_platform = { git = "https://github.com/zed-industries/zed", features = [
+    "font-kit",
+    "x11",
+    "runtime_shaders",
+] }
+# gpui-component は再現性のため rev 固定 (更新時は下記 assets と揃えて上げる)。
+gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "0775df394083c1ed74f36f846b78868d1267398f" }
+gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "0775df394083c1ed74f36f846b78868d1267398f" }

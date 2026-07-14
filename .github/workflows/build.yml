@@ -7,6 +7,8 @@ on:
       - "mcpr-cli/**"
       - "mcpr-lib/**"
       - "mcpr-ui/**"
+      - "mcpr-app/**"
+      - "mcpr-gpui/**"
       - "Cargo.lock"
       - "Cargo.toml"
       - ".cargo/**"
@@ -90,4 +92,43 @@ jobs:
       - run: rustup update ${{ matrix.toolchain }} && rustup default ${{ matrix.toolchain }}
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --release --all-targets --all-features
+
+  build_gui:
+    name: Lint and build native GUI (mcpr-gpui)
+    runs-on: ${{ matrix.os }}
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        toolchain:
+          - stable
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup update ${{ matrix.toolchain }} && rustup default ${{ matrix.toolchain }}
+      - uses: Swatinem/rust-cache@v2
+      # gpui は x11 バックエンド + xkbcommon をシステムライブラリにリンクするため、
+      # Linux のみ dev パッケージが必要。macOS (Metal) / Windows (D3D) はランナー標準で足りる。
+      # (wayland は無効化しているため libwayland-dev は不要。Vulkan は実行時 dlopen でビルド不要)
+      - name: Install gpui system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            xorg-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev
+      - name: Run lints (mcpr-gpui)
+        run: cargo clippy -p mcpr-gpui --all-targets --all-features
+      - name: Build project (mcpr-gpui)
+        run: cargo build -p mcpr-gpui --release --verbose
+      - name: Export GUI executable
+        uses: actions/upload-artifact@v7
+        with:
+          name: mcpr-gpui_${{ matrix.os }}
+          compression-level: 9
+          if-no-files-found: error
+          path: |
+            target/release/mcpr-gpui
+            target/release/mcpr-gpui.exe
 

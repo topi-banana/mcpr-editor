@@ -3,42 +3,36 @@
 //! interval はその ms ぶんオフセットを進める。行のフィルタはしない。
 //!
 //! ([`crate::export::export_merged`] の時刻オフセット計算をテストで独立に
-//! 検証するための参照実装。)
+//! 検証するための参照実装。モジュール全体が `#[cfg(test)]`。)
 
-#[cfg(test)]
-use std::{collections::BTreeSet, rc::Rc};
+use std::{collections::BTreeSet, sync::Arc};
 
-#[cfg(test)]
 use mcpr_lib::event::ReplayInfo;
 
-#[cfg(test)]
-use crate::app::{EventRow, Loaded, RowKind, categories_of};
+use crate::row::{EventRow, Loaded, RowKind, categories_of};
 
 /// 連結リストの 1 要素 (テスト用)。[`crate::export::MergeInput`] のテスト版。
-#[cfg(test)]
 enum MergeItem {
-    Replay(Rc<Loaded>),
+    Replay(Arc<Loaded>),
     Interval(u64),
 }
 
 /// 読み込み済みリプレイ列を並び順で連結する。リプレイが無ければ None、
-/// リプレイ 1 本だけ (interval なし) なら入力 Rc をそのまま返す (従来の単一
+/// リプレイ 1 本だけ (interval なし) なら入力 Arc をそのまま返す (従来の単一
 /// ファイル表示と完全に一致し、ポインタが安定するので下流の memo も再計算
 /// されない)。
-#[cfg(test)]
-fn merge_loaded(items: &[MergeItem]) -> Option<Rc<Loaded>> {
+fn merge_loaded(items: &[MergeItem]) -> Option<Arc<Loaded>> {
     match items {
         [MergeItem::Replay(single)] => Some(single.clone()),
         _ if items.iter().any(|i| matches!(i, MergeItem::Replay(_))) => {
-            Some(Rc::new(merge_many(items)))
+            Some(Arc::new(merge_many(items)))
         }
         _ => None,
     }
 }
 
-#[cfg(test)]
 fn merge_many(items: &[MergeItem]) -> Loaded {
-    let replays: Vec<&Rc<Loaded>> = items
+    let replays: Vec<&Arc<Loaded>> = items
         .iter()
         .filter_map(|i| match i {
             MergeItem::Replay(l) => Some(l),
@@ -82,7 +76,7 @@ fn merge_many(items: &[MergeItem]) -> Loaded {
             // mc_version / protocol_version / data_version は先頭から継承
             ..replays[0].info.clone()
         },
-        events: Rc::new(rows),
+        events: Arc::new(rows),
         categories,
     }
 }
@@ -90,7 +84,7 @@ fn merge_many(items: &[MergeItem]) -> Loaded {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::Category;
+    use crate::row::Category;
     use mcpr_lib::{event::State, protocol::LOGIN_PLAY_PACKET_ID};
 
     fn packet(time_ms: u64, id: i32, state: State) -> EventRow {
@@ -101,7 +95,7 @@ mod tests {
         }
     }
 
-    fn loaded(filename: &str, duration_ms: u64, rows: Vec<EventRow>) -> Rc<Loaded> {
+    fn loaded(filename: &str, duration_ms: u64, rows: Vec<EventRow>) -> Arc<Loaded> {
         loaded_with(filename, "ReplayMod", duration_ms, rows, &[])
     }
 
@@ -111,9 +105,9 @@ mod tests {
         duration_ms: u64,
         rows: Vec<EventRow>,
         players: &[u128],
-    ) -> Rc<Loaded> {
+    ) -> Arc<Loaded> {
         let categories = categories_of(&rows);
-        Rc::new(Loaded {
+        Arc::new(Loaded {
             filename: filename.to_string(),
             format,
             info: ReplayInfo {
@@ -121,7 +115,7 @@ mod tests {
                 players: players.iter().map(|&n| uuid::Uuid::from_u128(n)).collect(),
                 ..Default::default()
             },
-            events: Rc::new(rows),
+            events: Arc::new(rows),
             categories,
         })
     }
@@ -147,7 +141,7 @@ mod tests {
     fn single_file_is_identity() {
         let a = loaded("a.mcpr", 100, vec![packet(0, 0x02, State::Login)]);
         let merged = merge_loaded(&[Replay(a.clone())]).unwrap();
-        assert!(Rc::ptr_eq(&merged, &a));
+        assert!(Arc::ptr_eq(&merged, &a));
     }
 
     #[test]
@@ -210,7 +204,7 @@ mod tests {
     fn merged_info_combines_inputs() {
         let mut a = loaded_with("a.mcpr", "ReplayMod", 500, vec![], &[1, 2]);
         {
-            let info = &mut Rc::get_mut(&mut a).unwrap().info;
+            let info = &mut Arc::get_mut(&mut a).unwrap().info;
             info.mc_version = "1.21.11".to_string();
             info.protocol_version = 774;
             info.data_version = Some(4671);
